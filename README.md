@@ -21,5 +21,4 @@ The voxel models are **NOT** mine, these have been collected from all over the i
 [youtube video](https://www.youtube.com/watch?v=k4c949nH2sY)
 [linkedin post](https://www.linkedin.com/feed/update/urn:li:activity:7445191257531879426/?originTrackingId=lykDB1n90c6eZOPvVvxfBg%3D%3D)
 
-Minecraft destruction
 ![Minecraft model](readme_minecraft.png)
