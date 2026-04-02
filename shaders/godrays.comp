@@ -1,0 +1,233 @@
+#version 430 core
+
+#define INVPI		 0.31830988618379067153777
+#define INV2PI		 0.15915494309189533576888
+#define INV4PI       0.07957747154
+#define PI           3.14159265358979323846     // pi
+#define TWOPI        6.28318530717958647692528 // 2*pi
+#define GOLDEN_RATIO 1.618033988749894
+
+#define M_E        2.71828182845904523536   // e
+#define M_LOG2E    1.44269504088896340736   // log2(e)
+#define M_LOG10E   0.434294481903251827651  // log10(e)
+#define M_LN2      0.693147180559945309417  // ln(2)
+#define M_LN10     2.30258509299404568402   // ln(10)
+#define M_PI_4     0.785398163397448309616  // pi/4
+#define M_1_PI     0.318309886183790671538  // 1/pi
+#define M_2_PI     0.636619772367581343076  // 2/pi
+#define M_2_SQRTPI 1.12837916709551257390   // 2/sqrt(pi)
+#define M_SQRT2    1.41421356237309504880   // sqrt(2)
+#define M_SQRT1_2  0.707106781186547524401  // 1/sqrt(2)
+
+struct Ray{
+    vec3 o;
+    vec3 d;
+    float t;
+};
+
+uniform vec3 camPos;
+uniform vec3 camFront;
+
+uniform vec3 sunPosition;
+uniform vec3 sunTopLeft;
+uniform vec3 sunTopRight;
+uniform vec3 sunBottomLeft;
+
+
+uniform int frameNumber;
+uniform vec3 cTopLeft;
+uniform vec3 cTopRight;
+uniform vec3 cBottomLeft;
+
+
+uniform sampler2D shadowMap;
+uniform sampler2D depthBuffer;
+uniform float maxDepth;
+
+uniform int frameRandomSeed;
+
+
+
+
+layout (local_size_x = 32, local_size_y = 32) in;
+
+layout(rgba32f, binding = 0) uniform image2D imgOutput;
+
+uint g_seed;
+void InitializeSeed(uint s)
+{
+    s = (s ^ 61) & (s >> 16);
+    s *= 9;
+    s = s ^ (s >> 4);
+    s *= 0x27d4eb2d;
+    g_seed = s ^ (s >> 15);
+}
+
+uint RandomUint(){
+    g_seed ^= g_seed << 13;
+    g_seed ^= g_seed >> 17;
+    g_seed ^= g_seed << 5;
+
+    return g_seed;
+}
+
+// float from 0-1
+float RandomFloat(){
+    uint rng = RandomUint();
+
+    return float(rng) * 2.3283064365387e-10;
+}
+
+
+
+struct SampleInfo{
+    vec3 right;
+    vec3 down;
+    vec3 planeNormal;
+};
+
+bool ProjectOntoShadowMap(vec3 samplePosition, SampleInfo i){
+
+    
+    vec3 toSample = samplePosition - sunPosition;
+
+    // project ray ont sun direction ray
+    float denom = dot(toSample, i.planeNormal);
+    // gives you distance of plane along normal / distance of sample point along normal
+    float t = dot(sunTopLeft - sunPosition, i.planeNormal) / denom;
+    
+    if(t < 0)
+        return true;
+
+    // point on the screen-plane
+    vec3 hitPoint = sunPosition + t * toSample;
+
+    // calculate UV on the plane
+    vec3 offset = hitPoint - sunTopLeft;
+    float u = dot(offset, i.right) / dot(i.right, i.right); // length squared
+    float v = dot(offset, i.down)  / dot(i.down,  i.down);  // length squared
+
+    // skip samples outside the shadow map
+    if(u >= 0.0 && u <= 1.0 && v >= 0.0 && v <= 1.0){
+        float closestDepth = textureLod(shadowMap, vec2(u, v),0).r;
+        float currentDepth = length(toSample) / 500.0;
+        if(currentDepth > closestDepth)
+            return false;
+    }
+    // if outside of shadow map just full-bright
+    return true;
+}
+
+
+// https://en.wikipedia.org/wiki/Henyey%E2%80%93Greenstein_phase_function
+float PhaseHG(float cosTheta, float g){
+    float gSquared = g * g;
+
+    return INV4PI * (1 - gSquared) / pow(( 1 + gSquared - 2*g * cosTheta), 1.5);
+}
+
+
+void main(){
+
+
+    ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
+    
+    // get screen size
+    ivec2 size = imageSize(imgOutput);
+    if(pixel.x >= size.x || pixel.y >= size.y)
+        return;
+
+
+    uint pixelHash = pixel.x * 73856093u 
+                ^ pixel.y * 19349663u 
+                ^ frameNumber * 83492791u;
+
+    InitializeSeed(pixelHash);
+
+    // coords from 0-1
+    // reverse the V coord
+    float u = (float(pixel.x) + RandomFloat()) / float(size.x);
+    float v = (float(pixel.y) + RandomFloat()) / float(size.y);
+
+
+    // get ray dir
+    // point on the screen-plane
+    vec3 point = cTopLeft + 
+                    u * (cTopRight - cTopLeft) + 
+                    v * (cBottomLeft - cTopLeft); 
+
+    // global ray can be used for initial intersection
+    Ray ray;
+    ray.o = camPos;
+    ray.d = normalize(point - camPos);
+    ray.t = maxDepth * texelFetch(depthBuffer,pixel,0).w;
+
+
+    vec4 finalColor = imageLoad(imgOutput,pixel);
+    
+    // replace sunMatrix projection with this:
+    vec3 right    = sunTopRight   - sunTopLeft;
+    vec3 down     = sunBottomLeft - sunTopLeft;
+    vec3 planeNormal = normalize(cross(right, down));
+
+
+    float sigmaT = 0.125; // for beers law
+    float sigmaS = sigmaT * 0.8;  // scattering
+
+    float transmittance = 1.0;
+    vec3  inscattering = vec3(0.0);
+
+
+    const int maxGodRays = 30;
+    float stepSize = ray.t / maxGodRays;
+
+    float jitter = RandomFloat();
+
+    SampleInfo info;
+    info.right    = sunTopRight   - sunTopLeft;
+    info.down     = sunBottomLeft - sunTopLeft;
+    info.planeNormal = normalize(cross(right, down));
+
+
+    float tNear = 0.1;
+    float tFar = ray.t;
+    float logRatio = log(tFar / tNear);
+
+    vec3 sunDir     = normalize(sunPosition - camPos);
+    float cosTheta  = dot(ray.d,sunDir);
+    float phase     = mix(PhaseHG(cosTheta, 0.76), PhaseHG(cosTheta, -0.1),0.3);
+    
+    float invGodRays = 1 / float(maxGodRays);
+
+    for(int i = 0; i < maxGodRays; i++){
+        float fi = (float(i) + jitter) * invGodRays;
+        //float t = stepSize * (float(i) + jitter);
+
+        // help with claude for th exp and log.
+        float t = tNear * exp(fi * logRatio);
+        float dt = t * (exp(logRatio * invGodRays) - 1.0);
+
+        vec3 samplePosition = camPos + ray.d * t;
+        float visiblity = ProjectOntoShadowMap(samplePosition,info) ? 1.0 : 0.0;
+
+        inscattering += transmittance * visiblity * dt * sigmaS * phase;
+
+        transmittance *= exp(-sigmaT* dt);
+
+        if(transmittance < 0.001) break;
+    }
+        
+    vec3 godRayColor = vec3(1.0,0.8,0.3);
+    finalColor.xyz += inscattering * godRayColor;
+
+
+    // tonemapping :p
+    // After adding god rays to finalColor:
+    //vec3 mapped = finalColor.xyz / (finalColor.xyz + vec3(1.0)); // Reinhard
+    // optionally gamma correct:
+    //mapped = pow(mapped, vec3(1.0 / 2.2));
+    //finalColor.xyz = mapped;
+    
+    imageStore(imgOutput,pixel, finalColor);
+}
+

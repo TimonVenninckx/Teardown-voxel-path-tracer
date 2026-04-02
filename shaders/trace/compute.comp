@@ -1,0 +1,1003 @@
+#version 430 core
+
+#define INVPI		 0.31830988618379067153777
+#define INV2PI		 0.15915494309189533576888
+#define PI           3.14159265358979323846     // pi
+#define TWOPI        6.28318530717958647692528 // 2*pi
+#define GOLDEN_RATIO 1.618033988749894
+
+#define M_E        2.71828182845904523536   // e
+#define M_LOG2E    1.44269504088896340736   // log2(e)
+#define M_LOG10E   0.434294481903251827651  // log10(e)
+#define M_LN2      0.693147180559945309417  // ln(2)
+#define M_LN10     2.30258509299404568402   // ln(10)
+#define M_PI_4     0.785398163397448309616  // pi/4
+#define M_1_PI     0.318309886183790671538  // 1/pi
+#define M_2_PI     0.636619772367581343076  // 2/pi
+#define M_2_SQRTPI 1.12837916709551257390   // 2/sqrt(pi)
+#define M_SQRT2    1.41421356237309504880   // sqrt(2)
+#define M_SQRT1_2  0.707106781186547524401  // 1/sqrt(2)
+
+
+
+
+uniform vec3 camPos;
+uniform vec3 camFront;
+
+uniform int frameNumber;
+uniform vec3 cTopLeft;
+uniform vec3 cTopRight;
+uniform vec3 cBottomLeft;
+
+
+uniform sampler2D skydome;
+uniform sampler2D blueNoise;
+uniform sampler2D shadowMap;
+
+uniform int frameRandomSeed;
+uniform int lightCount;
+uniform int voxelVolumeCount;
+uniform int maxBounce;
+
+uniform float EPS = 0.0002;
+
+vec3 voxelSize = vec3(0.1);
+
+
+// different light types :)
+struct Light{
+    vec4  position;
+    vec4  direction;
+    vec4  color;
+    uint  type;
+    float innercutOff;
+    float outerCutOff;
+    float filler;
+};
+
+
+#define MATERIAL_DIFFUSE 0
+#define MATERIAL_METAL   1
+#define MATERIAL_GLASS   2
+#define MATERIAL_EMIT    3
+
+struct Material{
+    vec3 color;
+    uint type;
+    float emit;
+    float flux;
+    float ior;
+    float filler[1];
+};
+
+
+// might be too early but yeah..
+#define TLASLEFTRIGHT(NODE) floatBitsToUint(NODE.aabbmin.w)
+#define BLASCOUNT(NODE)     floatBitsToUint(NODE.aabbmax.w)
+
+// if leftRight == 0 its a leaf node
+struct TLASNode{
+    vec4 aabbmin;
+    // implicit leftright uint leftRight;
+    vec4 aabbmax;
+    // implicit blasuint blas;
+};
+
+
+struct Volume{
+    mat4 model;
+    mat4 invModel;
+    // amount of voxels in each direction.
+    ivec3 voxelDims;
+    uint startBrickIndex;
+    //world space aabb
+    // these can an should be removed
+    //vec4 aabbmin; // .w = padding
+    //vec4 aabbmax;
+};
+
+
+struct Ray{
+    vec3 o;
+    vec3 d;
+    float t;
+};
+
+
+
+layout(std430, binding = 1) buffer lights{
+    Light lightData[];
+};
+       
+layout(std430, binding = 2) buffer tlasBuffer{
+    TLASNode tlasNodes[];
+};
+
+layout(std430, binding = 3) buffer voxelDataBuffer{
+    int brickData[];
+};
+
+layout (std430, binding = 4) buffer volumeBuffer{
+    Volume voxelVolumes[];
+};
+
+layout(std430, binding = 5) buffer materialBuffer{
+    Material materialData[];
+};
+
+layout(std430, binding = 6) buffer brickBuffer{
+    uint bricks[];
+};
+
+layout(std430, binding = 7) buffer instanceBuffer{
+    uint instanceList[];
+};
+
+layout(std430, binding = 13) buffer brickMaskBuffer{
+    uint brickMaskData[];
+};
+
+
+
+//layout (local_size_x = 32, local_size_y = 32) in;
+layout (local_size_x = 16, local_size_y = 16) in;
+
+layout(rgba16f, binding = 0) uniform image2D imgOutput;
+
+//layout (location = 0) uniform float t;
+
+
+//
+// BLUE NOISE
+// https://blog.voxagon.se/2018/12/07/the-importance-of-good-noise.html
+//
+
+/*
+vec2 blueNoiseTexCoord = vec2(0);
+
+// from teardown
+// great way to sample blue noise
+const float GOLDEN_RATIO_1D = 0.618034005;
+const vec2  GOLDEN_RATIO_2D = vec2(0.75487762, 0.56984027);
+const vec3  GOLDEN_RATIO_3D = vec3(0.819172502, 0.671043575, 0.549700439);
+
+void InitializeBlueNoise(vec2 screenCoord){
+
+    // blue noise texture size
+    blueNoiseTexCoord  = (screenCoord * resolution) / 512.0;
+}
+
+float SampleBlueNoise1D(){
+    
+    float noiseValue = texture(blueNoise,blueNoiseTexCoord).r;
+    float randomValue = fract(noiseValue + GOLDEN_RATIO * frameRandomSeed);
+
+    blueNoiseTexCoord += GOLDEN_RATIO_1D;
+    return randomValue;
+}
+
+
+vec2 SampleBlueNoise2D(){
+    
+    vec2 noiseValue = texture(blueNoise,blueNoiseTexCoord).rg;
+    vec2 randomValue = fract(noiseValue + GOLDEN_RATIO * frameRandomSeed);
+
+    blueNoiseTexCoord += GOLDEN_RATIO_2D;
+    return randomValue;
+}
+
+vec3 SampleBlueNoise3D(){
+    
+    vec3 noiseValue = texture(blueNoise,blueNoiseTexCoord).rgb;
+    vec3 randomValue = fract(noiseValue + GOLDEN_RATIO * frameRandomSeed);
+
+    blueNoiseTexCoord += GOLDEN_RATIO_2D;
+    return randomValue;
+}
+*/
+
+uint g_seed;
+void InitializeSeed(uint s)
+{
+    s = (s ^ 61) & (s >> 16);
+    s *= 9;
+    s = s ^ (s >> 4);
+    s *= 0x27d4eb2d;
+    g_seed = s ^ (s >> 15);
+}
+
+uint RandomUint(){
+    g_seed ^= g_seed << 13;
+    g_seed ^= g_seed >> 17;
+    g_seed ^= g_seed << 5;
+
+    return g_seed;
+}
+
+// float from 0-1
+float RandomFloat(){
+    uint rng = RandomUint();
+
+    return float(rng) * 2.3283064365387e-10;
+}
+
+
+
+struct HitInfo{
+    vec3 normal;
+    // used to check if hit
+    uint voxelID;
+};
+
+
+
+struct HitResult{
+    bool hit;
+    float tmin;
+    float tmax;
+    int axis;
+};
+
+#ifdef TEST
+float IntersectAABBFloat(const Ray ray, const vec4 bmin, const vec4 bmax){
+
+    vec4 rayorigin = vec4(ray.o,0.0);
+    vec4 invDir = vec4(1.0 / max(abs(ray.d), vec3(1e-6)) * sign(ray.d),0.0);
+
+    vec4 t1 = (bmin - rayorigin) * invDir;
+    vec4 t2 = (bmax - rayorigin) * invDir;
+
+    vec4 vmin = min(t1,t2);
+    vec4 vmax = max(t1,t2);
+
+    float tmin = max(vmin.x,max(vmin.y,vmin.z));
+    float tmax = min(vmax.x,min(vmax.y,vmax.z));
+
+    if(tmax >= tmin && tmin < ray.t && tmax > 0)
+        return tmin;
+    return 1e30;
+}
+
+HitResult IntersectAABB(const Ray ray, const vec4 bmin, const vec4 bmax){
+    vec3 invDir = 1.0 / max(abs(ray.d), vec3(1e-6)) * sign(ray.d);
+    HitResult result;
+    result.hit = false;
+    result.axis = -1;
+    result.tmin = -1e30;
+    result.tmax =  1e30;
+
+
+    float tx1 = (bmin.x - ray.o.x) * invDir.x;
+    float tx2 = (bmax.x - ray.o.x) * invDir.x;
+    float txmin = min(tx1,tx2);
+    float txmax = max(tx1,tx2);
+    if(txmin > result.tmin){
+        result.tmin = txmin;
+        result.axis = 0;
+    }
+    result.tmax = min(result.tmax,txmax);
+
+
+    float ty1 = (bmin.y - ray.o.y) * invDir.y;
+    float ty2 = (bmax.y - ray.o.y) * invDir.y;
+    float tymin = min(ty1,ty2);
+    float tymax = max(ty1,ty2);
+    if(tymin > result.tmin){
+        result.tmin = tymin;
+        result.axis = 1;
+    }
+    result.tmax = min(result.tmax,tymax);
+
+    float tz1 = (bmin.z - ray.o.z) * invDir.z;
+    float tz2 = (bmax.z - ray.o.z) * invDir.z;
+    float tzmin = min(tz1,tz2);
+    float tzmax = max(tz1,tz2);
+    if(tzmin > result.tmin){
+        result.tmin = tzmin;
+        result.axis = 2;
+    }
+    result.tmax = min(result.tmax,tzmax);
+
+
+    if(result.tmax >= result.tmin && result.tmin < ray.t && result.tmax > 0)
+        result.hit = true;
+    return result;
+}
+
+#else
+
+float IntersectAABBFloat(const Ray ray, const vec4 bmin, const vec4 bmax){
+    vec3 invDir = 1.0 / max(abs(ray.d), vec3(1e-6)) * sign(ray.d);
+
+    float tx1 = (bmin.x - ray.o.x) * invDir.x;
+    float tx2 = (bmax.x - ray.o.x) * invDir.x;
+    float tmin = min(tx1,tx2);
+    float tmax = max(tx1,tx2);
+    float ty1 = (bmin.y - ray.o.y) * invDir.y;
+    float ty2 = (bmax.y - ray.o.y) * invDir.y;
+    tmin = max(tmin,min(ty1,ty2));
+    tmax = min(tmax,max(ty1,ty2));
+    float tz1 = (bmin.z - ray.o.z) * invDir.z;
+    float tz2 = (bmax.z - ray.o.z) * invDir.z;
+    tmin = max(tmin,min(tz1,tz2));
+    tmax = min(tmax,max(tz1,tz2));
+
+    if(tmax >= tmin && tmin < ray.t && tmax > 0)
+        return tmin;
+    return 1e30;
+}
+
+
+HitResult IntersectAABB(const Ray ray, const vec4 bmin, const vec4 bmax){
+    vec3 invDir = 1.0 / max(abs(ray.d), vec3(1e-6)) * sign(ray.d);
+    HitResult result;
+    result.hit = false;
+    result.axis = -1;
+    result.tmin = -1e30;
+    result.tmax =  1e30;
+
+
+    float tx1 = (bmin.x - ray.o.x) * invDir.x;
+    float tx2 = (bmax.x - ray.o.x) * invDir.x;
+    float txmin = min(tx1,tx2);
+    float txmax = max(tx1,tx2);
+    if(txmin > result.tmin){
+        result.tmin = txmin;
+        result.axis = 0;
+    }
+    result.tmax = min(result.tmax,txmax);
+
+
+    float ty1 = (bmin.y - ray.o.y) * invDir.y;
+    float ty2 = (bmax.y - ray.o.y) * invDir.y;
+    float tymin = min(ty1,ty2);
+    float tymax = max(ty1,ty2);
+    if(tymin > result.tmin){
+        result.tmin = tymin;
+        result.axis = 1;
+    }
+    result.tmax = min(result.tmax,tymax);
+
+    float tz1 = (bmin.z - ray.o.z) * invDir.z;
+    float tz2 = (bmax.z - ray.o.z) * invDir.z;
+    float tzmin = min(tz1,tz2);
+    float tzmax = max(tz1,tz2);
+    if(tzmin > result.tmin){
+        result.tmin = tzmin;
+        result.axis = 2;
+    }
+    result.tmax = min(result.tmax,tzmax);
+
+
+    if(result.tmax >= result.tmin && result.tmin < ray.t && result.tmax > 0)
+        result.hit = true;
+    return result;
+}
+
+#endif
+
+
+#define BRICKSIZE 8
+#define FULLBRICKSIZE BRICKSIZE*BRICKSIZE*BRICKSIZE 
+// 8 in each direction
+#define MAXSTEPS 24
+
+uint IsSolidVoxel(uint brickOffset, uvec3 voxel){
+    uint index = brickOffset + voxel.x + voxel.y * BRICKSIZE + voxel.z * BRICKSIZE * BRICKSIZE;
+
+    // get integer 32 offset
+    uint loadedMask = brickMaskData[index >> 5];
+    
+    uint bitIndex = index & 31;
+
+    // mask with full integer
+    uint customMask =  loadedMask & (1 << bitIndex); 
+
+    return customMask;
+}
+
+uint GetVoxel(uint brickOffset, uvec3 voxel){
+    uint index = brickOffset + voxel.x + voxel.y * BRICKSIZE + voxel.z * BRICKSIZE * BRICKSIZE;
+
+    // to get short
+    uint voxels4 = brickData[index >> 1];
+    // index 0 || 1
+    uint smallIndex = index & 1; 
+    // get a ushort
+    return (voxels4 >> (smallIndex * 16)) & 0xFFFF;
+}
+
+
+bool TraverseBrick(Ray localRay,uint brickIndex,int faxis,uvec3 brickCoord, in out float t,out uint voxelID, out vec3 normal){
+
+    int axis = faxis;
+    normal = vec3(0.0);
+
+    // removing an epsilon
+    float tEntry = t;
+    vec3 localPos = localRay.o + localRay.d * tEntry;
+
+    ivec3 vstep = ivec3(sign(localRay.d));
+
+    // Instead of globalVoxel % BRICKSIZE, compute relative to known brick origin
+    uvec3 brickBase = brickCoord * BRICKSIZE;
+    uvec3 voxel = uvec3(clamp(
+        ivec3(floor(localPos / voxelSize)) - ivec3(brickBase),
+        ivec3(0),
+        ivec3(BRICKSIZE - 1)
+    ));
+        
+    vec3 nextVoxelBoundary;
+    uvec3 globalVoxel = brickBase + voxel;
+
+    nextVoxelBoundary.x = (vstep.x > 0) ?
+        (float(globalVoxel.x) + 1.0) * voxelSize.x : float(globalVoxel.x) * voxelSize.x;
+    nextVoxelBoundary.y = (vstep.y > 0) ?
+        (float(globalVoxel.y) + 1.0) * voxelSize.y : float(globalVoxel.y) * voxelSize.y;
+    nextVoxelBoundary.z = (vstep.z > 0) ?
+        (float(globalVoxel.z) + 1.0) * voxelSize.z : float(globalVoxel.z) * voxelSize.z;
+
+    // no 0 division
+    const vec3 invdir = 1.0 / max(abs(localRay.d), vec3(0.000001));
+    const vec3 tDelta = voxelSize * invdir;
+
+    vec3 tMax = (nextVoxelBoundary - localPos) / localRay.d;
+
+
+    if(voxel.x >= BRICKSIZE
+    || voxel.y >= BRICKSIZE
+    || voxel.z >= BRICKSIZE)
+        return false;
+
+    const uint brickOffset = brickIndex * FULLBRICKSIZE;
+    uint val = GetVoxel(brickOffset, voxel);
+
+    for(int n = 0; n < MAXSTEPS; n++){
+
+        
+        #ifdef USEMASK
+        if(IsSolidVoxel(brickOffset,voxel) > 0){
+            voxelID = 3;
+            normal[axis] = -vstep[axis];
+            return true;
+        }
+        #else
+        // reading data
+        if(val > 0){
+            voxelID = val;
+            normal[axis] = -vstep[axis];
+            return true;
+        }
+        #endif
+
+        #ifdef TESTTRAVERSAL
+
+        if (tMax.x < tMax.y) {
+            if(tMax.x < tMax.z){
+                voxel.x += vstep.x;
+                t = tEntry + tMax.x;
+                tMax.x += tDelta.x;
+                axis = 0;
+                if(voxel.x >= BRICKSIZE)
+                    return false;
+            }
+            else{
+                voxel.z += vstep.z;
+                t = tEntry + tMax.z;
+                tMax.z += tDelta.z;
+                axis = 2;
+                if(voxel.z >= BRICKSIZE)
+                    return false;
+            }
+        }
+        else{
+            if(tMax.y < tMax.z){
+                voxel.y += vstep.y;
+                t = tEntry + tMax.y;
+                tMax.y += tDelta.y;
+                axis = 1;
+                if(voxel.y >= BRICKSIZE)
+                    return false;
+            }
+            else{
+                voxel.z += vstep.z;
+                t = tEntry + tMax.z;
+                tMax.z += tDelta.z;
+                axis = 2;
+                if(voxel.z >= BRICKSIZE)
+                    return false;
+            }
+        }
+
+        #else
+        if (tMax.x < tMax.y && tMax.x < tMax.z) {
+            voxel.x += vstep.x;
+            t = tEntry + tMax.x;
+            tMax.x += tDelta.x;
+            axis = 0;
+            if(voxel.x >= BRICKSIZE)
+                return false;
+        } else if (tMax.y < tMax.z) {
+            voxel.y += vstep.y;
+            t = tEntry + tMax.y;
+            tMax.y += tDelta.y;
+            axis = 1;
+            if(voxel.y >= BRICKSIZE)
+                return false;
+        } else {
+            voxel.z += vstep.z;
+            t = tEntry + tMax.z;
+            tMax.z += tDelta.z;
+            axis = 2;
+            if(voxel.z >= BRICKSIZE)
+                return false;
+        }
+        #endif
+
+        val = GetVoxel(brickOffset, voxel);
+    }
+    return false;
+}
+
+
+
+bool TraverseVolume(Ray localRay,uint voxelDataOffset,int faxis, ivec3 voxelBounds,in out float t,out uint voxelID, out vec3 normal){
+
+    int axis = faxis;
+    normal = vec3(0.0);
+
+    // removing an epsilon
+    float tEntry = t;
+    const vec3 perBrickSize = voxelSize * BRICKSIZE;
+
+    vec3 localPos = localRay.o + localRay.d * (tEntry);
+
+    uvec3 brick = ivec3(floor(localPos / perBrickSize));
+    const ivec3 bstep = ivec3(sign(localRay.d));
+    
+
+    vec3 nextBrickBoundary;
+    nextBrickBoundary.x = (bstep.x > 0) ? 
+        (float(brick.x) + 1.0) * perBrickSize.x : float(brick.x) * perBrickSize.x;
+    nextBrickBoundary.y = (bstep.y > 0) ? 
+        (float(brick.y) + 1.0) * perBrickSize.y : float(brick.y) * perBrickSize.y;
+    nextBrickBoundary.z = (bstep.z > 0) ? 
+        (float(brick.z) + 1.0) * perBrickSize.z : float(brick.z) * perBrickSize.z;
+
+    // no 0 division
+    vec3 invdir = 1.0 / max(abs(localRay.d), vec3(0.000001));
+
+    vec3 tMax = (nextBrickBoundary - localPos) / localRay.d;
+    vec3 tDelta = perBrickSize * invdir;
+
+
+    uvec3 brickBounds = (voxelBounds + (BRICKSIZE - 1)) / BRICKSIZE;
+      
+    // should never happen really..
+    if(brick.x >= brickBounds.x
+    || brick.y >= brickBounds.y
+    || brick.z >= brickBounds.z)
+        return false;
+    
+
+    // safety measure. no while loop
+    uint maxSteps = brickBounds.x + brickBounds.y + brickBounds.z;
+    for(int n = 0; n < maxSteps; n++){
+
+        // reading data
+        uint brickIndex = voxelDataOffset + brick.x + brick.y * brickBounds.x + brick.z * brickBounds.x * brickBounds.y;
+        uint brickAddress = bricks[brickIndex];
+        
+        if(brickAddress > 0){ // traverse brick
+            float tempT = t;
+            if(TraverseBrick(localRay, brickAddress, axis, brick, tempT,voxelID,normal)){
+                t = tempT;
+                return true;
+            }
+        }
+        #ifdef TESTTRAVERSAL
+
+        if (tMax.x < tMax.y) {
+            if(tMax.x < tMax.z){
+            brick.x += bstep.x;
+            t = tEntry + tMax.x;
+            tMax.x += tDelta.x;
+            axis = 0;
+            if(brick.x >= brickBounds.x)
+                return false;
+            }
+            else{
+            brick.z += bstep.z;
+            t = tEntry + tMax.z;
+            tMax.z += tDelta.z;
+            axis = 2;
+            if(brick.z >= brickBounds.z)
+                return false;
+            }
+        }
+        else{
+            if(tMax.y < tMax.z){
+            brick.y += bstep.y;
+            t = tEntry + tMax.y;
+            tMax.y += tDelta.y;
+            axis = 1;
+            if(brick.y >= brickBounds.y)
+                return false;
+            }
+            else{
+            brick.z += bstep.z;
+            t = tEntry + tMax.z;
+            tMax.z += tDelta.z;
+            axis = 2;
+            if(brick.z >= brickBounds.z)
+                return false;
+            }
+        }
+
+        #else
+        if (tMax.x < tMax.y && tMax.x < tMax.z) {
+            brick.x += bstep.x;
+            t = tEntry + tMax.x;
+            tMax.x += tDelta.x;
+            axis = 0;
+            if(brick.x >= brickBounds.x)
+                return false;
+        } else if (tMax.y < tMax.z) {
+            brick.y += bstep.y;
+            t = tEntry + tMax.y;
+            tMax.y += tDelta.y;
+            axis = 1;
+            if(brick.y >= brickBounds.y)
+                return false;
+        } else {
+            brick.z += bstep.z;
+            t = tEntry + tMax.z;
+            tMax.z += tDelta.z;
+            axis = 2;
+            if(brick.z >= brickBounds.z)
+                return false;
+        }
+        #endif
+    }
+    return false;
+}
+
+
+
+
+
+void Intersect(inout Ray ray,inout HitInfo info, in Volume volume){
+
+    ray.o = (volume.invModel * vec4(ray.o,1.0)).xyz; 
+    ray.d = (volume.invModel * vec4(ray.d,0.0)).xyz; 
+
+    // in the volumes object space
+    vec4 localMin = vec4(0.0);
+    vec4 localMax = vec4(vec3(volume.voxelDims) * voxelSize, 1.0);
+    HitResult result = IntersectAABB(ray,localMin,localMax);
+
+
+    if(result.hit){
+        float tEntry = max(result.tmin,0.0);
+        uint voxelID = 0;
+        vec3 normal;
+        float tHit = tEntry + 0.0005;
+        if(TraverseVolume(ray,volume.startBrickIndex,result.axis, volume.voxelDims.xyz, tHit, voxelID, normal)){
+            if(tHit < ray.t){
+                ray.t = tHit;
+                info.voxelID = voxelID;
+                info.normal = normalize((volume.model * vec4(normal,0.0)).xyz);
+            }
+        }
+    }
+}
+
+
+
+
+
+// normal
+// bvh traversal
+void Trace(inout Ray ray,inout HitInfo info){
+
+    info.voxelID = 0;
+    Ray cachedRay = ray;
+
+    // instead of recursive
+    // have a stack
+    uint stack[24];
+    uint stackPtr = 0;
+
+    TLASNode currentNode = tlasNodes[0];
+    for(int e = 0; e < 1000; e++){
+
+        if(BLASCOUNT(currentNode) > 0){ // isleaf()
+            uint instanceID = instanceList[TLASLEFTRIGHT(currentNode)];
+
+            Intersect(ray,info,voxelVolumes[instanceID]);
+            // turn ray back to world space
+            ray.o = cachedRay.o;
+            ray.d = cachedRay.d;
+
+            if(stackPtr == 0) 
+                    break;
+                else
+                    currentNode  = tlasNodes[stack[--stackPtr]];
+                continue;
+        }
+        
+        // 0xffff == 65535
+        uint left  = TLASLEFTRIGHT(currentNode);
+        uint right = left + 1;
+        TLASNode child1 = tlasNodes[left];
+        TLASNode child2 = tlasNodes[right];
+
+        float dist1 = IntersectAABBFloat( ray, child1.aabbmin,child1.aabbmax);
+        float dist2 = IntersectAABBFloat( ray, child2.aabbmin,child2.aabbmax);
+        if(dist1 > dist2){
+            float d = dist1;
+            dist1 = dist2;
+            dist2 = d;
+            TLASNode c = child1;
+            child1 = child2;
+            child2 = c;
+            
+            uint temp = left;
+            left = right;
+            right = temp;
+        }
+        if(dist1 == 1e30){
+            // missed both children nodes
+            if(stackPtr == 0)
+                break;
+            else
+                currentNode = tlasNodes[stack[--stackPtr]];
+        }
+        else
+        {
+            // visit near node;
+            // push far node if ray intersects
+            currentNode = child1;
+            if(dist2 != 1e30)   // the right node gets pushed on the stack
+                stack[stackPtr++] = right;
+        }
+    }
+}
+
+
+
+
+
+
+
+vec3 direction(vec3 normal, vec2 randomValues, float maxTheta) {
+    vec3 tangent = (normal.x > normal.z) ? vec3(-normal.y, normal.x, 0.0) : vec3(0.0, -normal.z, normal.y);
+    // and a bitangent vector orthogonal to both
+    vec3 bitangent = cross(normal, tangent);
+
+    float phi = 2.0 * PI * randomValues.x;
+    float theta = randomValues.y * maxTheta;
+    float sinTheta = sin(theta);
+    return tangent * cos(phi) * sinTheta + bitangent * sin(phi) * sinTheta + normal * cos(theta);
+}
+
+
+
+// not being used currently
+vec3 DiffuseReflection(vec3 normal){
+    
+    int k = 0;
+    vec3 reflection;
+    do
+    {
+        reflection = vec3(RandomFloat(),RandomFloat(),RandomFloat()) * 2 - 1;
+        k++;
+
+        if(k > 300)
+            return vec3(1.0);
+    } while(dot(reflection,normal) > 1);
+
+    return normalize(dot(normal,reflection) < 0 ? -reflection : reflection);
+}
+
+
+// Ray Tracing using HIP.pdf
+// input uniform random floats
+vec3 SampleHemisphere(){
+    
+    vec2 rand = vec2(RandomFloat(),RandomFloat());
+    //vec2 rand = SampleBlueNoise2D();
+
+    vec3 dir = vec3(0);
+    float phi = TWOPI * rand.x;
+    float r   = sqrt(rand.y);
+    // uniform in circle
+    dir.x = r * cos(phi);
+    dir.z = r * sin(phi);
+
+    // project onto hemisphere
+    dir.y = sqrt(max(1.0 - r * r, 0.0));
+
+    return dir;
+}
+
+
+
+//#define HEATMAP
+
+#ifdef HEATMAP
+#extension GL_ARB_shader_clock : enable
+#extension GL_NV_gpu_shader5 : enable
+#endif
+void main(){
+#ifdef HEATMAP
+    uint64_t startTime = clockARB(); // Requires GL_ARB_shader_clock
+#endif   
+    ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
+    
+    // get screen size
+    ivec2 size = imageSize(imgOutput);
+    if(pixel.x >= size.x || pixel.y >= size.y)
+        return;
+
+    {   // rng initialization
+        // can't start at 0                             random prime number
+        // Poor rng initialization
+        //uint initSeed = (1u + pixel.x + pixel.y * size.x);
+        //initSeed += frameNumber * 1299827u;
+
+        uint pixelHash = pixel.x * 73856093u 
+                   ^ pixel.y * 19349663u 
+                   ^ frameNumber * 83492791u;
+
+        InitializeSeed(pixelHash);
+    }
+    // coords from 0-1
+    // reverse the V coord
+    float u = (float(pixel.x) + RandomFloat()) / float(size.x);
+    float v = (float(pixel.y) + RandomFloat()) / float(size.y);
+
+
+    // get ray dir
+    // point on the screen-plane
+    vec3 point = cTopLeft + 
+                    u * (cTopRight - cTopLeft) + 
+                    v * (cBottomLeft - cTopLeft); 
+
+    // global ray can be used for initial intersection
+    Ray ray;
+    ray.o = camPos;
+    ray.d = normalize(point - camPos);
+    // important step
+    ray.t = 1e30;
+
+    
+
+    vec4 finalColor = vec4(0.0,0.0,0.0,1.0);
+    vec3 throughput = vec3(1.0);
+
+
+    if(maxBounce == 0){
+        HitInfo hitInfo;
+        Trace(ray, hitInfo);
+        
+        if(hitInfo.voxelID == 0){
+            // equirectangular panorama texture sampling with ray.d
+            // https://jacco.ompf2.com/2022/05/27/how-to-build-a-bvh-part-8-whitted-style/
+            float domeu = (atan(ray.d.z,ray.d.x) * INV2PI + 0.5);
+            float domev = (acos(ray.d.y) * INVPI);
+            vec4 backGroundColor =  texture(skydome,vec2(domeu,domev));
+
+            finalColor.xyz += throughput * backGroundColor.xyz;
+        }
+        else
+            finalColor.xyz = materialData[hitInfo.voxelID].color;
+
+        imageStore(imgOutput,pixel, finalColor);
+        return;
+    }
+    
+    for(int bounce = 0; bounce <= maxBounce; bounce++){
+        
+        HitInfo hitInfo;
+        Trace(ray, hitInfo);
+        
+        if(hitInfo.voxelID == 0){
+            // equirectangular panorama texture sampling with ray.d
+            // https://jacco.ompf2.com/2022/05/27/how-to-build-a-bvh-part-8-whitted-style/
+            float domeu = (atan(ray.d.z,ray.d.x) * INV2PI + 0.5);
+            float domev = (acos(ray.d.y) * INVPI);
+            vec4 backGroundColor =  texture(skydome,vec2(domeu,domev));
+
+            finalColor.xyz += throughput * backGroundColor.xyz;
+            break;
+        }
+
+        
+        vec3 albedo = materialData[hitInfo.voxelID].color;
+        
+        vec3 I = ray.o + ray.d * ray.t;
+        vec3 normal = hitInfo.normal;
+        
+        // https://jacco.ompf2.com/2024/05/29/ray-tracing-with-voxels-in-c-series-part-6/
+        vec3 brdf = albedo * INVPI;
+
+        vec3 c1 = cross(normal, vec3(0.0, 0.0, 1.0));
+        vec3 c2 = cross(normal, vec3(0.0, 1.0, 0.0));
+
+        vec3 tangent;
+        if(length(c1) > length(c2))
+            tangent = c1;
+        else
+            tangent = c2;
+
+        tangent = normalize(tangent);
+        vec3 bitangent = cross(normal, tangent);
+        bitangent = normalize(bitangent);
+
+        // The hemisphere is Y - up . Transform the Y axis to the normal
+        vec3 s = SampleHemisphere();
+        
+        vec3 reflection = tangent * s.x + bitangent * s.z + normal * s.y;
+        //vec3 reflection = DiffuseReflection(normal);
+
+        
+        float refractionOffset = 0;
+        bool foundLight = false;
+        switch(materialData[hitInfo.voxelID].type){
+        case MATERIAL_GLASS:
+            float cDot = dot(ray.d,normal);
+            if(abs(cDot) > RandomFloat()){
+                //reflection = refract(ray.d,normal,1.0 / materialData[hitInfo.voxelID].ior);
+                reflection = refract(ray.d,normal,1.0);
+                refractionOffset = 1.0;
+            }
+            else{
+                reflection = reflect(ray.d,normal);
+                //throughput *= cDot * INV2PI;
+            }
+            break;
+        case MATERIAL_METAL:
+            break;
+        case MATERIAL_EMIT:
+            finalColor.xyz += albedo
+            * pow(materialData[hitInfo.voxelID].emit * 8.0,materialData[hitInfo.voxelID].flux)
+            * throughput;
+
+            foundLight = true;
+            break;
+        default:
+            break;
+        }
+        if(foundLight){
+            break;  
+        }
+
+        //float pdf = 1.0 / TWOPI;
+        throughput *= albedo;
+
+        const bool UsingRussianRoulette = true;
+            if(UsingRussianRoulette && bounce > 0){
+                float russianRoulette = max(throughput.x,max(throughput.y,throughput.z));
+                if(RandomFloat() > russianRoulette){
+                    break;
+                }
+                throughput *= 1 / russianRoulette;
+            }
+
+        ray.d = normalize(reflection);
+        ray.o = I + ray.d * voxelSize * (EPS) + refractionOffset * -normal;
+        ray.t = 1e30;
+    }
+
+    // if couln't find light after 4 bounces
+    #ifdef HEATMAP
+    if(heatMap){
+        uint64_t elapsed = clockARB() - startTime;
+        imageStore(imgOutput, pixel, vec4(float(elapsed) / heatMapThreshold ,0.0,0.0,1.0));
+        return;
+    }
+    #endif
+    imageStore(imgOutput,pixel, finalColor);
+}
+

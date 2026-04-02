@@ -1,0 +1,93 @@
+#version 430 core
+#define INVPI		 0.31830988618379067153777
+#define INV2PI		 0.15915494309189533576888
+#define PI           3.14159265358979323846     // pi
+#define TWOPI        6.28318530717958647692528 // 2*pi
+#define GOLDEN_RATIO 1.618033988749894
+
+#define M_E        2.71828182845904523536   // e
+#define M_LOG2E    1.44269504088896340736   // log2(e)
+#define M_LOG10E   0.434294481903251827651  // log10(e)
+#define M_LN2      0.693147180559945309417  // ln(2)
+#define M_LN10     2.30258509299404568402   // ln(10)
+#define M_PI_4     0.785398163397448309616  // pi/4
+#define M_1_PI     0.318309886183790671538  // 1/pi
+#define M_2_PI     0.636619772367581343076  // 2/pi
+#define M_2_SQRTPI 1.12837916709551257390   // 2/sqrt(pi)
+#define M_SQRT2    1.41421356237309504880   // sqrt(2)
+#define M_SQRT1_2  0.707106781186547524401  // 1/sqrt(2)
+
+
+
+uniform bool readingBufferA;
+
+struct RayCastInfo{
+    vec4 o;
+    vec4 d;         // seed
+    vec4 throughput;// pixelindex
+};
+
+struct RayKey{
+    uint key;
+    uint rayIndex;
+};
+
+
+layout(std430, binding = 8) buffer rayBufferA{
+    uint readIndexA;
+    uint writeIndexA;
+    RayCastInfo rayListA[];
+};
+
+layout(std430, binding = 9) buffer rayBufferB{
+    uint readIndexB;
+    uint writeIndexB;
+    RayCastInfo rayListB[];
+};
+
+layout(std430, binding = 10) buffer rayKeyBuffer{
+    RayKey raykeys[];
+};
+
+layout(std430, binding = 11) buffer sortedKeyBuffer{
+    RayKey sortedKeys[];
+};
+
+
+layout(std430, binding = 12) buffer rayBucketsBuffer{
+    uint buckets[256];
+};
+
+layout(local_size_x = 256) in;
+shared uint localHist[256];
+shared uint localBase[256];
+
+void main(){
+    
+    uint tid = gl_GlobalInvocationID.x;
+    uint lid = gl_LocalInvocationID.x;
+
+    localHist[lid] = 0;
+    barrier();
+
+    uint writeIndex = readingBufferA ? writeIndexA : writeIndexB;
+    uint bucketId = 0xFF;
+    if(tid < writeIndex){
+        bucketId = raykeys[tid].key & 0xFF;
+        atomicAdd(localHist[bucketId],1);
+    }
+    barrier();
+
+    if(localHist[lid] > 0)
+        localBase[lid] = atomicAdd(buckets[lid],localHist[lid]);
+    barrier();
+    localHist[lid] = 0;
+    barrier();
+    
+    if(tid < writeIndex){
+        uint localOffset = atomicAdd(localHist[bucketId],1);
+        uint dest = localBase[bucketId] + localOffset;
+        sortedKeys[dest] = raykeys[tid];
+    }
+}
+

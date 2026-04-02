@@ -1,0 +1,36 @@
+#version 430 core
+
+
+
+layout(rgba32f, binding = 0) uniform image2D screen;
+
+layout(rgba32f, binding = 1) uniform image2D accumulator;
+
+uniform int frameSinceMoved;
+
+
+layout (local_size_x = 32, local_size_y = 32) in;
+
+void main(){
+    ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
+    
+    ivec2 size = imageSize(screen);
+    
+    if(pixel.x >= size.x || pixel.y >= size.y)
+        return;
+
+    if(frameSinceMoved <= 1){
+        imageStore(accumulator,pixel,imageLoad(screen,pixel));
+    }
+    else{
+        vec4 previousVal = imageLoad(screen,pixel);
+        vec4 newValue= imageLoad(accumulator,pixel);
+
+        vec4 totalValue = (previousVal + newValue);
+        
+        imageStore(accumulator,pixel,totalValue);
+        imageStore(screen,pixel,totalValue / float(frameSinceMoved));
+    }
+
+
+}

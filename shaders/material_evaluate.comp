@@ -1,0 +1,543 @@
+#version 430 core
+//wavefront start
+#define INVPI		 0.31830988618379067153777
+#define INV2PI		 0.15915494309189533576888
+#define PI           3.14159265358979323846     // pi
+#define TWOPI        6.28318530717958647692528 // 2*pi
+#define GOLDEN_RATIO 1.618033988749894
+
+#define M_E        2.71828182845904523536   // e
+#define M_LOG2E    1.44269504088896340736   // log2(e)
+#define M_LOG10E   0.434294481903251827651  // log10(e)
+#define M_LN2      0.693147180559945309417  // ln(2)
+#define M_LN10     2.30258509299404568402   // ln(10)
+#define M_PI_4     0.785398163397448309616  // pi/4
+#define M_1_PI     0.318309886183790671538  // 1/pi
+#define M_2_PI     0.636619772367581343076  // 2/pi
+#define M_2_SQRTPI 1.12837916709551257390   // 2/sqrt(pi)
+#define M_SQRT2    1.41421356237309504880   // sqrt(2)
+#define M_SQRT1_2  0.707106781186547524401  // 1/sqrt(2)
+
+
+
+uniform sampler2D skydome; 
+
+
+uniform int lightCount;
+uniform vec2 resolution;
+uniform int maxBounce;
+
+uniform float maxDepth = 1e30;
+uniform float EPS = 0.0002;
+uniform bool lastBounce;
+
+vec3 voxelSize = vec3(0.1);
+uint g_seed;
+
+
+// different light types :)
+struct Light{
+    vec4  position;
+    vec4  direction;
+    vec4  color;
+    uint  type;
+    float innercutOff;
+    float outerCutOff;
+    float filler;
+};
+
+
+struct Sphere{
+    vec3 pos;
+    float radius;
+    uint material;
+    float filler[3];
+};
+
+
+
+
+#define MATERIAL_DIFFUSE 0
+#define MATERIAL_METAL   1
+#define MATERIAL_GLASS   2
+#define MATERIAL_EMIT    3
+
+struct Material{
+    vec3 color;
+    uint type;
+    float emit;
+    float flux;
+    float ior;
+    float filler[1];
+};
+
+
+// might be too early but yeah..
+#define TLASLEFTRIGHT(NODE) floatBitsToUint(NODE.aabbmin.w)
+#define BLASCOUNT(NODE)     floatBitsToUint(NODE.aabbmax.w)
+
+// if blascount == 0 its a leaf node
+struct TLASNode{
+    vec4 aabbmin;
+    // implicit leftright uint leftRight;
+    vec4 aabbmax;
+    // implicit blasuint blas;
+};
+
+
+struct Volume{
+    mat4 model;
+    mat4 invModel;
+    // amount of voxels in each direction.
+    ivec3 voxelDims;
+    uint startBrickIndex;
+    //world space aabb
+    // these can an should be removed
+    vec4 aabbmin; // .w = padding
+    vec4 aabbmax;
+};
+
+
+struct Ray{
+    vec3 o;
+    vec3 d;
+    float t;
+};
+
+
+struct RayCastInfo{
+    vec4 o;         // .w flags
+    vec4 d;         // .w per-ray-seed
+    vec4 throughput;// .w pixelindex
+};
+
+struct ShadeInfo{
+    vec4 material;
+};  
+
+
+
+
+
+layout(std430, binding = 1) buffer lights{
+    Light lightData[];
+};
+       
+
+layout(std430, binding = 5) buffer materialBuffer{
+    Material materialData[];
+};
+
+layout(std430, binding = 8) buffer rayReadBuffer{
+    uint rayReadIndex;
+    uint rayMaxReadIndex;
+    uint filler1[2];
+    RayCastInfo rayReadList[];
+};
+
+layout(std430, binding = 9) buffer rayWriteBuffer{
+    uint notused2;
+    uint rayWriteIndex;
+    uint filler2[2];
+    RayCastInfo rayWriteList[];
+};
+
+layout(std430, binding = 10) buffer rayShadeBuffer{
+    uint shadeReadIndex;
+    uint shadeWriteIndex;
+    uint filler3[2];
+    ShadeInfo rayShadeList[];
+};
+
+
+layout(std430, binding = 12) buffer shadowRayBuffer{
+    uint readIndexShadow;
+    uint writeIndexShadow;
+    uint filler4[2];
+    RayCastInfo rayListShadow[];
+};
+
+
+//layout (local_size_x = 16, local_size_y = 16) in;
+layout (local_size_x = 32, local_size_y = 32) in;
+layout(rgba32f, binding = 0) uniform image2D imgOutput;
+layout(rgba32f, binding = 1) uniform image2D normalDepthBuffer;
+layout(rgba32f, binding = 2) uniform image2D positionBuffer;
+layout(rgba32f, binding = 3) uniform image2D albedoBuffer;
+
+
+vec2 EncodeNormal(vec3 n)
+{
+    n /= abs(n.x) + abs(n.y) + abs(n.z);
+    if (n.z < 0.0) 
+        n.xy = (1.0 - abs(n.yx)) * sign(n.xy);
+    return n.xy * 0.5 + 0.5;
+}
+
+void StoreRay(vec3 origin, vec3 dir, vec3 throughput, ivec2 pixel, bool hitMirror, bool refracting){
+
+    RayCastInfo i;
+    
+
+    i.o.xyz = origin;
+
+    uint flags = uint(hitMirror);
+    flags |= (refracting ? 2 : 0);
+    i.o.w = uintBitsToFloat(flags);
+
+    i.d.xyz = dir;
+    i.d.w = uintBitsToFloat(g_seed);
+    
+    ivec2 size = imageSize(imgOutput);
+
+
+    i.throughput.xyz = throughput;
+    int pixelIndex = pixel.x + pixel.y * size.x;
+    i.throughput.w = intBitsToFloat(pixelIndex);
+    
+    
+    uint index = atomicAdd(rayWriteIndex, 1);
+
+    rayWriteList[index] = i;
+}
+
+
+
+
+
+void InitializeSeed(uint s)
+{
+    s = (s ^ 61) & (s >> 16);
+    s *= 9;
+    s = s ^ (s >> 4);
+    s *= 0x27d4eb2d;
+    g_seed = s ^ (s >> 15);
+}
+
+uint RandomUint(){
+    g_seed ^= g_seed << 13;
+    g_seed ^= g_seed >> 17;
+    g_seed ^= g_seed << 5;
+
+    return g_seed;
+}
+
+// float from 0-1
+float RandomFloat(){
+    uint rng = RandomUint();
+
+    return float(rng) * 2.3283064365387e-10;
+}
+
+
+vec3 direction(vec3 normal, vec2 randomValues, float maxTheta) {
+    vec3 tangent = (normal.x > normal.z) ? vec3(-normal.y, normal.x, 0.0) : vec3(0.0, -normal.z, normal.y);
+    // and a bitangent vector orthogonal to both
+    vec3 bitangent = cross(normal, tangent);
+
+    float phi = 2.0 * PI * randomValues.x;
+    float theta = randomValues.y * maxTheta;
+    float sinTheta = sin(theta);
+    return tangent * cos(phi) * sinTheta + bitangent * sin(phi) * sinTheta + normal * cos(theta);
+}
+
+
+
+// not being used currently
+vec3 DiffuseReflection(vec3 normal){
+    
+    int k = 0;
+    vec3 reflection;
+    do
+    {
+        reflection = vec3(RandomFloat(),RandomFloat(),RandomFloat()) * 2 - 1;
+        k++;
+
+        if(k > 300)
+            return vec3(1.0);
+    } while(dot(reflection,normal) > 1);
+
+    return normalize(dot(normal,reflection) < 0 ? -reflection : reflection);
+}
+
+
+// Ray Tracing using HIP.pdf
+// input uniform random floats
+vec3 SampleHemisphere(){
+    
+    vec2 rand = vec2(RandomFloat(),RandomFloat());
+    //vec2 rand = SampleBlueNoise2D();
+
+    vec3 dir = vec3(0);
+    float phi = TWOPI * rand.x;
+    float r   = sqrt(rand.y);
+    // uniform in circle
+    dir.x = r * cos(phi);
+    dir.z = r * sin(phi);
+
+    // project onto hemisphere
+    dir.y = sqrt(max(1.0 - r * r, 0.0));
+
+    return dir;
+}
+
+/*
+struct RayCastInfo{
+    vec4 o;         // .w nothing yet
+    vec4 d;         // .w max-t value; how far to travel until hit light
+    vec4 throughput;// .w pixelindex
+};
+*/
+
+void StoreShadowRay(vec3 origin, vec3 normal, vec3 throughput, ivec2 pixel){
+
+    uint lightIndex = RandomUint() % lightCount;
+    
+    float dist = 1.0;
+    vec3 dir = vec3(1.0);
+
+    float distanceAttenuation = 1.0;
+    switch(lightData[lightIndex].type){
+        case 0:{ // Dir light
+            // negate direction as we are trying to go towards the light
+            dir = normalize(-lightData[lightIndex].direction.xyz);
+            // small offset for self-occlusion
+            dist = 1e30;
+            break;
+        }
+        case 1: { // point light
+            dir = lightData[lightIndex].position.xyz - origin;
+            dist = length(dir);
+            dir /= dist;
+            distanceAttenuation = 1 / (dist * dist);
+            break;
+        }
+        case 2: {// spotlight
+            dir = lightData[lightIndex].position.xyz - origin;
+            dist = length(dir);
+            dir /= dist;
+
+            vec3 negatedSpotLightDir = normalize(-lightData[lightIndex].direction.xyz);
+            // https://gamedev.stackexchange.com/questions/69475/how-do-i-use-the-dot-product-to-get-an-angle-between-two-vectors
+            // both normalized angle = arccos(dot(A,B) / (|A|* |B|)).
+            // https://learnopengl.com/Lighting/Light-casters
+            float theta = dot(dir,negatedSpotLightDir);
+            // early out
+            if(theta < lightData[lightIndex].outerCutOff){
+                return;
+            }
+            distanceAttenuation = 1 / (dist * dist);
+            break;
+        }
+    }
+
+    float cosa = dot(dir,normal);
+    if(cosa <= 0.0)
+        return; 
+
+
+    origin += EPS * voxelSize * mix(normal,dir, cosa);
+
+    RayCastInfo i;
+    i.o.xyz = origin;
+    
+    i.d.xyz = dir;
+    i.d.w = dist;
+
+    vec3 light = lightData[lightIndex].color.xyz * distanceAttenuation;
+    i.throughput.xyz = throughput * light * cosa * lightCount;
+
+    ivec2 size = imageSize(imgOutput);
+    int pixelIndex = pixel.x + pixel.y * size.x;
+    i.throughput.w = intBitsToFloat(pixelIndex);
+
+    uint atomicIndex = atomicAdd(writeIndexShadow, 1);
+    rayListShadow[atomicIndex] = i;
+};
+
+
+void GetRayCastInfo(out vec3 origin, out vec3 dir, out vec3 throughput, out ivec2 pixel, out uint seed, out bool hitMirror, out bool startingInside, out uint material, uint index){
+    
+    RayCastInfo i;
+    
+    i = rayReadList[index];
+    
+    origin = i.o.xyz;
+    material = floatBitsToUint(i.o.w);
+    //uint flags = floatBitsToUint(i.o.w);
+    //hitMirror = bool(1 & flags);
+    //startingInside = bool(2  & flags);
+
+    dir = i.d.xyz;
+    seed = floatBitsToUint(i.d.w);
+    throughput = i.throughput.xyz;
+    int pixelIndex = floatBitsToInt(i.throughput.w);
+    
+    ivec2 size = imageSize(imgOutput);
+    pixel.x = pixelIndex % size.x;
+    pixel.y = pixelIndex / size.x;
+
+}
+
+// Encode
+vec2 OctWrap(vec2 v) {
+    return (1.0 - abs(v.yx)) * sign(v.xy);
+}
+
+vec2 encodeNormal(vec3 n) {
+    n /= (abs(n.x) + abs(n.y) + abs(n.z));
+    n.xy = n.z >= 0.0 ? n.xy : OctWrap(n.xy);
+    return n.xy * 0.5 + 0.5; // pack to [0, 1]
+}
+
+vec3 decodeNormal(vec2 enc) {
+    enc = enc * 2.0 - 1.0;
+    vec3 n = vec3(enc.x, enc.y, 1.0 - abs(enc.x) - abs(enc.y));
+    float t = clamp(-n.z, 0.0, 1.0);
+    n.xy -= sign(n.xy) * t;
+    return normalize(n);
+}
+
+
+
+bool ReadRay(out Ray ray, out vec3 throughput, out ivec2 pixel, out vec3 normal, out uint material){
+
+    uint index = atomicAdd(rayReadIndex, 1);
+    if(index >= rayMaxReadIndex)
+        return false;
+
+    bool test;
+    GetRayCastInfo(ray.o, ray.d, throughput,pixel,g_seed,test,test,material, index);
+
+    
+    ShadeInfo s;
+    s = rayShadeList[index];
+    normal = decodeNormal(s.material.zw);
+    ray.t = s.material.y;// s.normalDepth.w;
+    material = floatBitsToUint(s.material.x);
+
+    return true;
+}
+
+
+
+void main(){
+    const ivec2 size = imageSize(imgOutput);
+    Ray ray;
+    vec3 throughput;
+    ivec2 pixel;
+    vec3  normal;
+    uint material;
+
+    
+    bool rayStartedInside = false; // TEMP
+    bool previouslyHitMirror = false;
+
+    while(true){
+
+        if(!ReadRay(ray,throughput,pixel,normal,material))
+            return;
+
+        vec4 finalColor = vec4(0,0,0,1);
+        
+        bool foundLight = false;
+        vec3 albedo = materialData[material].color;
+        if(material == 0){
+            // equirectangular panorama texture sampling with ray.d
+            // https://jacco.ompf2.com/2022/05/27/how-to-build-a-bvh-part-8-whitted-style/
+            float domeu = (atan(ray.d.z,ray.d.x) * INV2PI + 0.5);
+            float domev = (acos(ray.d.y) * INVPI);
+            vec4 backGroundColor =  texture(skydome,vec2(domeu,domev));
+            foundLight = true;
+            albedo = backGroundColor.xyz;
+            finalColor.xyz += throughput * backGroundColor.xyz;
+        }
+
+        albedo = max(albedo,0.00001);
+
+        vec3 I = ray.o + ray.d * ray.t;
+        
+        // https://jacco.ompf2.com/2024/05/29/ray-tracing-with-voxels-in-c-series-part-6/
+        vec3 brdf = albedo * INVPI;
+
+        vec3 c1 = cross(normal, vec3(0.0, 0.0, 1.0));
+        vec3 c2 = cross(normal, vec3(0.0, 1.0, 0.0));
+
+        vec3 tangent = length(c1) > length(c2)? c1 : c2;
+
+        tangent = normalize(tangent);
+        vec3 bitangent = cross(normal, tangent);
+        bitangent = normalize(bitangent);
+
+        // The hemisphere is Y - up . Transform the Y axis to the normal
+        vec3 s = SampleHemisphere();
+        vec3 reflection = tangent * s.x + bitangent * s.z + normal * s.y;
+
+
+        bool refractingInwards = rayStartedInside;
+        bool hitMirror = false;
+        switch(materialData[material].type){
+        case MATERIAL_GLASS:
+            hitMirror = true;
+            float ior = materialData[material].ior;
+            float eta = rayStartedInside ? ior : 1.0 / ior;
+            float cDot = dot(normal, ray.d);
+            float k = 1.0 - eta * eta * (1.0 - cDot * cDot);
+            if(k > 0.0 && RandomFloat() < k){
+                reflection = eta * ray.d - (eta * cDot + sqrt(k)) * normal;
+                refractingInwards = !rayStartedInside;
+            }
+            else{
+                reflection = reflect(ray.d,normal);
+            }
+            break;
+        case MATERIAL_EMIT:
+            finalColor.xyz += albedo
+            * pow(materialData[material].emit * 8.0,materialData[material].flux)
+            * throughput;
+
+            //  * (1 / ray.t * ray.t) doesn't seem to do anything here.
+
+            foundLight = true;
+            break;
+        default:
+            break;
+        }
+
+        if(foundLight){
+            finalColor.xyz += imageLoad(imgOutput,pixel).xyz;
+            imageStore(imgOutput, pixel, finalColor);
+        }
+        else{
+            const bool beersLaw = false;
+            if(beersLaw && rayStartedInside){ // beers law
+                vec3 absorbtion = exp(-albedo * ray.t * voxelSize);
+                throughput *= absorbtion;
+            }
+            else
+                throughput *= albedo;
+
+            const bool UsingRussianRoulette = true;
+            if(UsingRussianRoulette){
+                float russianRoulette = max(throughput.x,max(throughput.y,throughput.z));
+                if(RandomFloat() >= russianRoulette){
+                    continue;
+                }
+                throughput *= 1 / russianRoulette;
+            }
+            ray.d = normalize(reflection);
+            ray.o = I + ray.d * voxelSize * (EPS);
+
+            
+            StoreShadowRay(I,normal,throughput,pixel);
+
+            if(!lastBounce)                         //  AKA IF FIRST ALBEDO HAS BEEN FOUND
+                StoreRay(ray.o,ray.d,throughput,pixel,hitMirror && previouslyHitMirror, refractingInwards);
+        }
+
+        if(previouslyHitMirror && !hitMirror){
+            //imageStore(albedoBuffer,pixel,vec4(max(albedo,0.000001),1.0));
+        }
+    }
+}
+

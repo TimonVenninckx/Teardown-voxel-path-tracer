@@ -1,0 +1,145 @@
+#version 430 core
+
+
+
+
+layout(rgba16f, binding = 0) uniform image2D writeBuffer;
+
+
+uniform int iteration;
+uniform sampler2D readTexture;
+uniform sampler2D normalAndDepthTexture;
+uniform sampler2D momentsTexture;
+
+
+layout (local_size_x = 32, local_size_y = 32) in;
+
+
+#define EPS 0.00001
+
+
+
+float CalculateLuminance(vec3 Colour)
+{
+    return 0.2126 * Colour.r + 0.7152 * Colour.g + 0.0722 * Colour.b;
+}
+
+
+float GetVariance(ivec2 p){
+
+    return texelFetch(readTexture,p,0).w;
+}
+
+float FilterVariance(ivec2 p){
+    float sum = 0;
+    float weight = 0;
+    const float k[3] = { 0.25, 0.5, 0.25};
+    ivec2 size = imageSize(writeBuffer);
+
+    for(int x = -1; x <= 1; x++){
+        for(int y = -1; y <= 1; y++){
+            float w = k[x+1]*k[y+1];
+
+            ivec2 pixel = clamp(p + ivec2(x,y),ivec2(0),size - 1);
+            sum += w * GetVariance(pixel);
+            weight += w;
+        }
+    }
+    return sum / max(weight,EPS);
+}
+
+
+uniform  float sigmaz = 1;
+uniform  float sigman = 128;
+uniform  float sigmal = 4;
+
+
+float CalculateEdgeStopWeight(ivec2 p, ivec2 q, float variance, vec2 gradientZ, vec4 pNormalDepth, vec3 pillumination){
+    // p = current pixel
+    // q is the pixel we are checking
+    // normaldepth had depth in the .w component.
+    
+    vec4 qNormalDepth = texelFetch(normalAndDepthTexture,q,0);
+
+    vec3 qlum = texelFetch(readTexture,q,0).xyz;
+
+    float depthWeight;
+    {   // depth::::
+        vec2 offset = vec2(p - q);
+        float numerator = abs(pNormalDepth.w - qNormalDepth.w);
+
+        float expectedDiff = abs(dot(gradientZ, offset));
+        float denominator = max(expectedDiff * sigmaz, 0.001); 
+
+        depthWeight = exp(-(numerator/denominator));
+    }
+    float normalWeight;
+    {
+        normalWeight = pow(max(0.0,dot(pNormalDepth.xyz,qNormalDepth.xyz)),sigman);
+    }
+    float illumWeight;
+    {
+
+        const float denominator = sigmal * sqrt(max(0, EPS + variance));
+        illumWeight = exp(-(abs(CalculateLuminance(pillumination) - CalculateLuminance(qlum)) / denominator));
+    }
+        
+    return depthWeight * normalWeight * illumWeight;
+}
+
+
+
+
+
+void main(){
+    ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 size = imageSize(writeBuffer);
+
+    if(pixel.x >= size.x || pixel.y >= size.y) return;
+
+    
+    vec4 pNormalDepth = texelFetch(normalAndDepthTexture,pixel,0);
+    if(pNormalDepth.w >= 1.0){
+    vec4 color = texelFetch(readTexture,pixel,0);
+        imageStore(writeBuffer,pixel,color);
+        return;
+    }
+
+    float filteredVariance = FilterVariance(pixel);
+    vec3 pillumination = texelFetch(readTexture,pixel,0).xyz;
+
+
+    float zRight = texelFetch(normalAndDepthTexture, pixel + ivec2(1,0), 0).w;
+    float zLeft  = texelFetch(normalAndDepthTexture, pixel - ivec2(1,0), 0).w;
+    float zUp    = texelFetch(normalAndDepthTexture, pixel + ivec2(0,1), 0).w;
+    float zDown  = texelFetch(normalAndDepthTexture, pixel - ivec2(0,1), 0).w;
+    vec2 gradientZ = vec2(zRight - zLeft, zUp - zDown) * 0.5;
+
+
+    const float weights[5] = { 1.0/16.0, 1.0/4.0, 3.0/8.0, 1.0/4.0, 1.0/16.0 };
+    float sumVariance = 0;
+    vec3 sumColour = vec3(0);
+    float sumWeight = 0;
+    int stepSize = 1 << iteration;
+    for(int x = -2; x <= 2; x++){
+        for(int y = -2; y <= 2; y++){
+            ivec2 q = pixel + ivec2(x,y) * stepSize;
+            if(q.x < 0 || q.y < 0 || q.x >= size.x || q.y >= size.y)
+                continue;
+
+            float kernelWeight = weights[x+2] * weights[y+2];
+            float edgeStopWeight = CalculateEdgeStopWeight(pixel, q, filteredVariance, gradientZ, pNormalDepth, pillumination);
+            float pixelWeight = kernelWeight * edgeStopWeight;
+
+
+            sumColour += pixelWeight * texelFetch(readTexture, q,0).xyz;
+            sumWeight += pixelWeight;
+
+            sumVariance += pixelWeight * pixelWeight * GetVariance(q);
+        }
+    }
+    
+    vec3 final = sumColour / max(sumWeight,EPS);
+    float finalVariance = sumVariance / max((sumWeight * sumWeight),EPS);
+    imageStore(writeBuffer,pixel,vec4(final,finalVariance));
+}

@@ -1,0 +1,202 @@
+#version 430 core
+
+
+
+layout(rgba16f, binding = 0) uniform image2D movementBuffer;
+
+layout(rgba16f, binding = 2) uniform image2D taaBuffer;
+
+layout(rgba16f, binding = 5) uniform image2D momentsBuffer;
+
+
+uniform sampler2D worldPositionTexture;
+uniform sampler2D taaTexture;
+uniform sampler2D displayTexture;
+uniform sampler2D previousMomentsTexture;
+
+uniform sampler2D previousNormalTexture;
+uniform sampler2D normalTexture;
+
+uniform sampler2D albedoTexture;
+
+
+uniform float temporalAlpha = 0.01;
+
+
+uniform vec4 left;
+uniform vec4 right;
+uniform vec4 top;
+uniform vec4 bottom;
+
+layout (local_size_x = 32, local_size_y = 32) in;
+
+
+float CalculateLuminance(vec3 Colour)
+{
+    return 0.2126 * Colour.r + 0.7152 * Colour.g + 0.0722 * Colour.b;
+}
+
+// return 0 or 1
+int IsReprojectionValid(ivec2 pixelLocation, vec4 prevNormDepth, vec4 curNormDepth){
+    const ivec2 size = imageSize(movementBuffer);
+
+    if(pixelLocation.x < 0 || pixelLocation.y < 0 || pixelLocation.x >= size.x || pixelLocation.y >= size.y){
+        return 0;
+    }
+    
+    if(dot(curNormDepth.xyz, prevNormDepth.xyz) < 0.9)
+        return 0;
+
+    if(abs(prevNormDepth.w - curNormDepth.w) / max(curNormDepth.w,0.01) > 0.2)
+        return 0;
+    
+
+    return 1;
+}
+
+
+void main(){
+    ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
+    const ivec2 size = imageSize(movementBuffer);
+
+    
+    if(pixel.x >= size.x || pixel.y >= size.y) return;
+    
+
+
+    vec3 p = texelFetch(worldPositionTexture,pixel, 0).xyz;
+    vec4 curNormDepth = texelFetch(normalTexture,pixel,0);
+    
+    if(curNormDepth.w >= 1.0){
+        imageStore(movementBuffer, pixel, vec4(0.0));
+        vec3 skyColor = texelFetch(displayTexture, pixel, 0).xyz;
+        imageStore(taaBuffer,     pixel, vec4(1.0));
+        float lum = CalculateLuminance(skyColor);
+        imageStore(momentsBuffer, pixel, vec4(lum, lum*lum, 1.0, 1.0));
+        return;
+    }
+
+    vec2 prevPixelFloat;
+    ivec2 prevPixel;
+    {   // reprojection
+        vec4 prevPixelMovement = vec4(0.0,0.0,0.0,1.0);
+        
+        float dLeft   = dot(left.xyz  ,p) - left.w;
+        float dRight  = dot(right.xyz ,p) - right.w;
+        float dTop    = dot(top.xyz   ,p) - top.w;
+        float dBottom = dot(bottom.xyz,p) - bottom.w;
+
+        prevPixelMovement.x = dLeft / (dLeft + dRight);
+        prevPixelMovement.y = dTop / (dTop  + dBottom);
+
+        prevPixelFloat = prevPixelMovement.xy * vec2(size);
+        prevPixel = ivec2(prevPixelFloat);
+
+        //prevPixelMovement.x -= float(pixel.x) / float(size.x);
+        //prevPixelMovement.y -= float(pixel.y) / float(size.y);
+    }
+
+    vec3 bilinearColor = vec3(0);
+    vec2 bilinearMoments = vec2(0);
+    float bilinearHistory = 0;
+    float sumWeights = 0;
+    int bilinearHits = 0;
+    // fractional part of reprojected position
+    float fx = fract(prevPixelFloat.x);
+    float fy = fract(prevPixelFloat.y);
+
+    // bilinear weights per tap
+    const float w[4] = {
+        (1-fx) * (1-fy),   // top-left
+          fx   * (1-fy),   // top-right
+        (1-fx) *   fy,     // bottom-left
+          fx   *   fy      // bottom-right
+    };
+    const ivec2 bilinearPos[4] = {
+        {0,0},
+        {1,0},
+        {0,1},
+        {1,1},
+    };
+
+    for(int i = 0; i < 4; i++){
+        if(w[i] == 0.0)
+            continue;
+        ivec2 pixelLocation = prevPixel + bilinearPos[i];
+            
+        vec4 prevNormalDepth = texelFetch(previousNormalTexture,pixelLocation,0);
+        int valid = IsReprojectionValid(pixelLocation, prevNormalDepth,curNormDepth);
+
+        vec3 momentsAndHist = texelFetch(previousMomentsTexture,pixelLocation,0).xyz;
+        vec2 moments = momentsAndHist.xy;
+        float historyLength = momentsAndHist.z;
+        bilinearMoments += valid * w[i] * moments;
+        bilinearColor   += valid * w[i] * texelFetch(taaTexture,pixelLocation,0).xyz;
+        bilinearHistory += valid * w[i] * historyLength;
+        sumWeights      += valid * w[i];
+        bilinearHits    += valid;
+    }
+
+    const ivec2 offsets[9] = { 
+        {-1,-1}, { 0,-1}, { 1,-1},
+        {-1, 0}, { 0, 0}, { 1, 0},
+        {-1, 1}, { 0, 1}, { 1, 1}
+    };
+
+    if(bilinearHits == 0){ // if 2x2 doesn't hit we do a 3x3
+        for(int i = 0; i < 9; i++){
+            ivec2 pixelLocation = prevPixel + offsets[i];
+            
+            vec4 prevNormalDepth = texelFetch(previousNormalTexture,pixelLocation,0);
+            int valid = IsReprojectionValid(pixelLocation, prevNormalDepth,curNormDepth);
+    
+            vec3 momentsAndHist = texelFetch(previousMomentsTexture,pixelLocation,0).xyz;
+            vec2 moments = momentsAndHist.xy;
+            float historyLength = momentsAndHist.z;
+            bilinearMoments += valid * moments;
+            bilinearColor   += valid * texelFetch(taaTexture,pixelLocation,0).xyz;
+            bilinearHistory += valid * historyLength;
+            sumWeights      += valid;
+            bilinearHits    += valid;
+        }
+        sumWeights = bilinearHits;
+    }
+
+    vec3 albedo = max(texelFetch(albedoTexture,pixel,0).xyz,0.001);
+    
+    vec3 color;
+    vec3 newColor = max(texelFetch(displayTexture,pixel,0).xyz / albedo,0.0001);
+    vec2 moments;
+    moments.x = CalculateLuminance(newColor);
+    moments.y = moments.x * moments.x;
+
+
+    imageStore(movementBuffer,pixel,vec4(prevPixelFloat,0.0,0.0));
+    if(bilinearHits == 0){
+        color  = newColor;
+        bilinearHistory = 1.0;
+    }
+    else{
+        bilinearColor /= sumWeights;
+        bilinearMoments /= sumWeights;
+        bilinearHistory /= sumWeights;
+
+        float alphaColor   = max(temporalAlpha, 1.0 / (bilinearHistory + 1.0));
+        float alphaMoments = max(0.1, 1.0 / (bilinearHistory + 1.0));
+
+        // normal check
+        color   = mix(bilinearColor  , newColor, alphaColor);
+        moments = mix(bilinearMoments, moments , alphaMoments);
+
+        bilinearHistory = min(64, bilinearHistory + 1.0);
+    }
+
+    color = any(isnan(color)) || any(isinf(color)) ? newColor : color;
+
+
+    imageStore(taaBuffer,pixel,vec4(color,1.0));
+    imageStore(momentsBuffer,pixel,vec4(moments,bilinearHistory,0.0));
+    
+    
+
+}

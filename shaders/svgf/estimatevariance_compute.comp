@@ -1,0 +1,95 @@
+#version 430 core
+
+
+
+layout(rgba16f, binding = 0) uniform image2D writeTexture;
+
+uniform sampler2D momentsHistTexture;
+uniform sampler2D colorTexture;
+uniform sampler2D normalTexture;
+
+
+layout (local_size_x = 32, local_size_y = 32) in;
+
+
+float CalculateLuminance(vec3 Colour)
+{
+    return 0.2126 * Colour.r + 0.7152 * Colour.g + 0.0722 * Colour.b;
+}
+
+
+
+void main(){
+    const ivec2 size = imageSize(writeTexture);
+    ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
+
+    if(pixel.x >= size.x || pixel.y >= size.y) return;
+
+
+    vec4 normalDepth = texelFetch(normalTexture,pixel,0);
+    vec3 momentsAndHistory = texelFetch(momentsHistTexture,pixel,0).xyz;
+    vec3 color   = max(texelFetch(colorTexture,pixel,0).xyz,0.00001);
+    vec2 moments = max(momentsAndHistory.xy,0.00001);
+
+    if(normalDepth.w >= 1.0){
+        float variance = max(0, moments.y - moments.x * moments.x);
+        imageStore(writeTexture,pixel,vec4(color,variance));
+        return;
+    }
+
+    float histLength = momentsAndHistory.z;
+
+
+    const float historyThreshold = 4.0;
+    if(histLength < historyThreshold){
+
+        float weightSum = 1.0;
+        int r = histLength > 1 ? 2 : 3;
+        for(int y = -r; y <= r; y++){        
+            for(int x = -r; x <= r; x++){    
+                if(x != 0 || y != 0){
+                    ivec2 p = pixel + ivec2(x,y);
+
+                    if(p.x < 0 || p.y < 0 || p.x >= size.x || p.y >= size.y) continue;
+
+                    vec3 pColor = texelFetch(colorTexture,p,0).xyz;
+                    vec4 pNormalDepth = texelFetch(normalTexture,p,0);
+
+                    float normalWeight = pow(max(0,dot(normalDepth.xyz,pNormalDepth.xyz)),128.0);
+                    float depthWeight  = abs(pNormalDepth.w - normalDepth.w) / (normalDepth.w * length(vec2(x,y)) + 0.001);
+
+                    float w = exp(-depthWeight) * normalWeight;
+
+                    if(isnan(w))
+                        w = 0.0;
+
+                    weightSum += w;
+                    moments += w * texelFetch(momentsHistTexture,p,0).xy;
+                    color   += w * pColor;
+
+                }
+            }
+        }
+        moments = max(moments,0.00001);
+        color   = max(color  ,0.00001);
+
+        moments /= weightSum;
+        color   /= weightSum;
+
+        
+        const float histThreshold = 4.0;
+        // taken from original ASVGF-code
+        float variance = (1.0 + 3.0 * (1.0 - histLength / histThreshold)) 
+            * max(0, moments.y - moments.x * moments.x);
+
+
+        //imageStore(writeTexture,pixel,vec4(color,variance));
+
+        vec3 origColor = max(texelFetch(colorTexture, pixel, 0).xyz, 0.00001);
+        imageStore(writeTexture, pixel, vec4(origColor, variance));
+    }
+    else{
+        float variance = max(0, moments.y - moments.x * moments.x);
+        imageStore(writeTexture,pixel,vec4(color,variance));
+    }
+}

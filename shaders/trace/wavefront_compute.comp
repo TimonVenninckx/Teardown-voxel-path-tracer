@@ -1,0 +1,983 @@
+#version 430 core
+// wavefront bounce
+#define INVPI		 0.31830988618379067153777
+#define INV2PI		 0.15915494309189533576888
+#define PI           3.14159265358979323846     // pi
+#define TWOPI        6.28318530717958647692528 // 2*pi
+#define GOLDEN_RATIO 1.618033988749894
+
+#define M_E        2.71828182845904523536   // e
+#define M_LOG2E    1.44269504088896340736   // log2(e)
+#define M_LOG10E   0.434294481903251827651  // log10(e)
+#define M_LN2      0.693147180559945309417  // ln(2)
+#define M_LN10     2.30258509299404568402   // ln(10)
+#define M_PI_4     0.785398163397448309616  // pi/4
+#define M_1_PI     0.318309886183790671538  // 1/pi
+#define M_2_PI     0.636619772367581343076  // 2/pi
+#define M_2_SQRTPI 1.12837916709551257390   // 2/sqrt(pi)
+#define M_SQRT2    1.41421356237309504880   // sqrt(2)
+#define M_SQRT1_2  0.707106781186547524401  // 1/sqrt(2)
+
+#extension GL_KHR_shader_subgroup_ballot : enable
+#extension GL_KHR_shader_subgroup_basic : enable
+
+uniform vec3 camPos;
+
+uniform int frameNumber;
+uniform vec3 cTopLeft;
+uniform vec3 cTopRight;
+uniform vec3 cBottomLeft;
+uniform sampler2D skydome;
+
+uniform sampler2D blueNoise;
+uniform sampler2D shadowMap;
+uniform sampler2D readImageOut;
+
+
+uniform int frameRandomSeed;
+uniform int lightCount;
+uniform int voxelVolumeCount;
+uniform int maxBounce;
+uniform int maxDiffuseBounce;
+uniform bool lastBounce;
+uniform bool traceSpheres;
+uniform float maxDepth = 1e30;
+uniform float EPS = 0.0002;
+
+vec3 voxelSize = vec3(0.1);
+uint g_seed;
+
+
+// different light types :)
+struct Light{
+    vec4  position;
+    vec4  direction;
+    vec4  color;
+    uint  type;
+    float innercutOff;
+    float outerCutOff;
+    float filler;
+};
+
+struct Sphere{
+    vec3 pos;
+    float radius;
+    uint material;
+    float filler[3];
+};
+
+#define MATERIAL_DIFFUSE 0
+#define MATERIAL_METAL   1
+#define MATERIAL_GLASS   2
+#define MATERIAL_EMIT    3
+
+struct Material{
+    vec3 color;
+    uint type;
+    float emit;
+    float flux;
+    float ior;
+    float filler[1];
+};
+
+// might be too early but yeah..
+#define TLASLEFTRIGHT(NODE) floatBitsToUint(NODE.aabbmin.w)
+#define BLASCOUNT(NODE)     floatBitsToUint(NODE.aabbmax.w)
+
+// if blascount == 0 its a leaf node
+struct TLASNode{
+    vec4 aabbmin;
+    // implicit leftright uint leftRight;
+    vec4 aabbmax;
+    // implicit blasuint blas;
+};
+
+
+struct Volume{
+    mat4 model;
+    mat4 invModel;
+    // amount of voxels in each direction.
+    ivec3 voxelDims;
+    uint startBrickIndex;
+};
+
+
+struct Ray{
+    vec3 o;
+    bool inside;
+    vec3 d;
+    float t;
+};
+
+
+struct RayCastInfo{
+    vec4 o;
+    vec4 d;         // seed
+    vec4 throughput;// pixelindex
+};
+
+
+
+
+struct HitInfo{
+    vec3 normal;
+    // used to check if hit
+    uint voxelID;
+};
+
+struct HitResult{
+    bool hit;
+    float tmin;
+    float tmax;
+    int axis;
+};
+
+
+
+layout(std430, binding = 1) buffer lights{
+    Light lightData[];
+};
+       
+layout(std430, binding = 2) buffer voxelTlasBuffer{
+    TLASNode voxelTlasNodes[];
+};
+
+layout(std430, binding = 3) buffer voxelDataBuffer{
+    uint brickData[];
+};
+
+layout (std430, binding = 4) buffer volumeBuffer{
+    Volume voxelVolumes[];
+};
+
+layout(std430, binding = 5) buffer materialBuffer{
+    Material materialData[];
+};
+
+layout(std430, binding = 6) buffer brickBuffer{
+    uint bricks[];
+};
+
+layout(std430, binding = 7) buffer voxelInstanceBuffer{
+    uint voxelInstanceList[];
+};
+
+layout(std430, binding = 8) buffer rayReadBuffer{
+    uint rayReadIndex;
+    uint rayMaxReadIndex;
+    RayCastInfo rayReadList[];
+};
+
+layout(std430, binding = 9) buffer rayWriteBuffer{
+    uint notused2;
+    uint rayWriteIndex;
+    RayCastInfo rayWriteList[];
+};
+
+layout(std430, binding = 12) buffer shadowRayBuffer{
+    uint readIndexShadow;
+    uint writeIndexShadow;
+    RayCastInfo rayListShadow[];
+};
+
+layout(std430, binding = 13) buffer sphereBuffer{
+    Sphere sphereList[];
+};
+
+layout(std430, binding = 14) buffer sphereTlasBuffer{
+    TLASNode sphereTlasNodes[];
+};
+layout(std430, binding = 15) buffer sphereInstanceBuffer{
+    uint sphereInstanceList[];
+};
+
+
+//layout (local_size_x = 16, local_size_y = 16) in;
+//layout (local_size_x = 32, local_size_y = 32) in;
+layout (local_size_x = 1024, local_size_y = 1) in;
+
+layout(rgba32f, binding = 0) uniform image2D imgOutput;
+layout(rgba16f, binding = 3) uniform image2D albedoBuffer;
+
+void StoreRay(vec3 origin, vec3 dir, vec3 throughput, ivec2 pixel, bool hitMirror, bool refracting, uint diffuseHitsCounter){
+    RayCastInfo i;
+
+    uint index = atomicAdd(rayWriteIndex, 1);
+
+    i.o.xyz = origin;
+
+    // first 4 bits are for diffusehits counter 0-15
+    uint flags = (diffuseHitsCounter & 15);
+    flags |= (hitMirror  ? (1 << 4) : 0);
+    flags |= (refracting ? (1 << 5) : 0);
+    i.o.w = uintBitsToFloat(flags);
+
+    i.d.xyz = dir;
+    i.throughput.xyz = throughput;
+
+    i.d.w = uintBitsToFloat(g_seed);
+    
+    ivec2 size = imageSize(imgOutput);
+    int pixelIndex = pixel.x + pixel.y * size.x;
+    i.throughput.w = intBitsToFloat(pixelIndex);
+
+    rayWriteList[index] = i;
+}
+
+bool GetRayCastInfo(out vec3 origin, out vec3 dir, out vec3 throughput, out ivec2 pixel, out uint seed, out bool hitMirror, out bool startingInside, out uint diffuseHits){
+    
+    RayCastInfo i;
+    uint index = atomicAdd(rayReadIndex, 1);
+    //uint index = atomicCounterIncrement(aReadIndexA);
+    if(index >= rayMaxReadIndex)
+        return false;
+    i = rayReadList[index];
+    
+    origin = i.o.xyz;
+    
+    // first 4 bits are for diffusehits counter 0-15
+    uint flags = floatBitsToUint(i.o.w);
+    hitMirror      = bool((1 << 4) & flags);
+    startingInside = bool((1 << 5) & flags);
+    diffuseHits    = (15 & flags);
+
+    dir = i.d.xyz;
+    seed = floatBitsToUint(i.d.w);
+    throughput = i.throughput.xyz;
+    int pixelIndex = floatBitsToInt(i.throughput.w);
+    
+    ivec2 size = imageSize(imgOutput);
+    pixel.x = pixelIndex % size.x;
+    pixel.y = pixelIndex / size.x;
+
+    return true;
+}
+
+void InitializeSeed(uint s)
+{
+    s = (s ^ 61) & (s >> 16);
+    s *= 9;
+    s = s ^ (s >> 4);
+    s *= 0x27d4eb2d;
+    g_seed = s ^ (s >> 15);
+}
+
+uint RandomUint(){
+    g_seed ^= g_seed << 13;
+    g_seed ^= g_seed >> 17;
+    g_seed ^= g_seed << 5;
+
+    return g_seed;
+}
+
+// float from 0-1
+float RandomFloat(){
+    uint rng = RandomUint();
+
+    return float(rng) * 2.3283064365387e-10;
+}
+
+
+
+float IntersectAABBFloat(const Ray ray, const vec3 bmin, const vec3 bmax){
+    vec3 invDir = 1.0 / max(abs(ray.d), vec3(1e-6)) * sign(ray.d);
+
+    float tx1 = (bmin.x - ray.o.x) * invDir.x;
+    float tx2 = (bmax.x - ray.o.x) * invDir.x;
+    float tmin = min(tx1,tx2);
+    float tmax = max(tx1,tx2);
+    float ty1 = (bmin.y - ray.o.y) * invDir.y;
+    float ty2 = (bmax.y - ray.o.y) * invDir.y;
+    tmin = max(tmin,min(ty1,ty2));
+    tmax = min(tmax,max(ty1,ty2));
+    float tz1 = (bmin.z - ray.o.z) * invDir.z;
+    float tz2 = (bmax.z - ray.o.z) * invDir.z;
+    tmin = max(tmin,min(tz1,tz2));
+    tmax = min(tmax,max(tz1,tz2));
+
+    if(tmax >= tmin && tmin < ray.t && tmax > 0)
+        return tmin;
+    return 1e30;
+}
+
+
+HitResult IntersectAABB(const Ray ray, const vec3 bmin, const vec3 bmax){
+    vec3 invDir = 1.0 / max(abs(ray.d), vec3(1e-6)) * sign(ray.d);
+    HitResult result;
+    result.hit = false;
+    result.axis = -1;
+    result.tmin = -1e30;
+    result.tmax =  1e30;
+
+
+    float tx1 = (bmin.x - ray.o.x) * invDir.x;
+    float tx2 = (bmax.x - ray.o.x) * invDir.x;
+    float txmin = min(tx1,tx2);
+    float txmax = max(tx1,tx2);
+    if(txmin > result.tmin){
+        result.tmin = txmin;
+        result.axis = 0;
+    }
+    result.tmax = min(result.tmax,txmax);
+
+
+    float ty1 = (bmin.y - ray.o.y) * invDir.y;
+    float ty2 = (bmax.y - ray.o.y) * invDir.y;
+    float tymin = min(ty1,ty2);
+    float tymax = max(ty1,ty2);
+    if(tymin > result.tmin){
+        result.tmin = tymin;
+        result.axis = 1;
+    }
+    result.tmax = min(result.tmax,tymax);
+
+    float tz1 = (bmin.z - ray.o.z) * invDir.z;
+    float tz2 = (bmax.z - ray.o.z) * invDir.z;
+    float tzmin = min(tz1,tz2);
+    float tzmax = max(tz1,tz2);
+    if(tzmin > result.tmin){
+        result.tmin = tzmin;
+        result.axis = 2;
+    }
+    result.tmax = min(result.tmax,tzmax);
+
+
+    if(result.tmax >= result.tmin && result.tmin < ray.t && result.tmax > 0)
+        result.hit = true;
+    return result;
+}
+
+
+
+#define BRICKSIZE 8
+#define FULLBRICKSIZE BRICKSIZE*BRICKSIZE*BRICKSIZE 
+// bricksize in each direction
+#define MAXSTEPS BRICKSIZE*3
+
+uint GetVoxel(uint brickOffset, uvec3 voxel){
+    uint index = brickOffset + voxel.x + voxel.y * BRICKSIZE + voxel.z * BRICKSIZE * BRICKSIZE;
+
+    // to get short
+    uint voxels4 = brickData[index >> 1];
+    // index 0 || 1
+    uint smallIndex = index & 1; 
+    // get a ushort
+    return (voxels4 >> (smallIndex * 16)) & 0xFFFF;
+}
+
+bool ExampleTraverse(Ray ray, out float t, inout uint voxelID, out vec3 normal);
+
+
+bool TraverseBrick(Ray localRay,uint brickIndex,int faxis,uvec3 brickCoord, in out float t,inout uint voxelID, out vec3 normal){
+
+    int axis = faxis;
+    normal = vec3(0.0);
+
+    // removing an epsilon
+    float tEntry = t;
+    vec3 localPos = localRay.o + localRay.d * tEntry;
+
+    ivec3 vstep = ivec3(sign(localRay.d));
+
+    uvec3 brickBase = brickCoord * BRICKSIZE;
+    uvec3 voxel     = uvec3(clamp(
+        uvec3(floor(localPos / voxelSize) - brickBase),
+        uvec3(0),
+        uvec3(BRICKSIZE - 1)
+        ));
+
+    uvec3 globalVoxel = brickBase + voxel;
+        
+    vec3 nextVoxelBoundary;
+    nextVoxelBoundary.x = (vstep.x > 0) ? 
+        (float(globalVoxel.x) + 1.0) * voxelSize.x : float(globalVoxel.x) * voxelSize.x;
+    nextVoxelBoundary.y = (vstep.y > 0) ? 
+        (float(globalVoxel.y) + 1.0) * voxelSize.y : float(globalVoxel.y) * voxelSize.y;
+    nextVoxelBoundary.z = (vstep.z > 0) ? 
+        (float(globalVoxel.z) + 1.0) * voxelSize.z : float(globalVoxel.z) * voxelSize.z;
+
+    // no 0 division
+    const vec3 invdir = 1.0 / max(abs(localRay.d), vec3(0.000001));
+    const vec3 tDelta = voxelSize * invdir;
+
+    vec3 tMax = (nextVoxelBoundary - localPos) / localRay.d;
+
+
+    if(voxel.x >= BRICKSIZE
+    || voxel.y >= BRICKSIZE
+    || voxel.z >= BRICKSIZE)
+        return false;
+
+    const uint brickOffset = brickIndex * FULLBRICKSIZE;
+    
+    
+    uint previousVoxelID = voxelID;
+    voxelID = GetVoxel(brickOffset, voxel);
+    // start inside
+    if(localRay.inside){ // inspired by voxpopuli - Jacco :P
+        for(int n = 0; n < MAXSTEPS; n++){
+            // reading data
+            if(voxelID == 0 && previousVoxelID  != 0){ // searching for an empty voxel :o
+                voxelID = previousVoxelID;
+                normal[axis] = -vstep[axis];
+                return true;
+            }
+
+            if (tMax.x < tMax.y && tMax.x < tMax.z) {
+                voxel.x += vstep.x;
+                t = tEntry + tMax.x;
+                tMax.x += tDelta.x;
+                axis = 0;
+                if(voxel.x >= BRICKSIZE)
+                    return false;
+            } else if (tMax.y < tMax.z) {
+                voxel.y += vstep.y;
+                t = tEntry + tMax.y;
+                tMax.y += tDelta.y;
+                axis = 1;
+                if(voxel.y >= BRICKSIZE)
+                    return false;
+            } else {
+                voxel.z += vstep.z;
+                t = tEntry + tMax.z;
+                tMax.z += tDelta.z;
+                axis = 2;
+                if(voxel.z >= BRICKSIZE)
+                    return false;
+            }
+            previousVoxelID = voxelID;
+            voxelID = GetVoxel(brickOffset, voxel);
+        }
+    }
+    else{ // normal traversal
+        for(int n = 0; n < MAXSTEPS; n++){
+            // reading data
+            if(voxelID > 0){
+                normal[axis] = -vstep[axis];
+                return true;
+            }
+            if (tMax.x < tMax.y && tMax.x < tMax.z) {
+                voxel.x += vstep.x;
+                t = tEntry + tMax.x;
+                tMax.x += tDelta.x;
+                axis = 0;
+                if(voxel.x >= BRICKSIZE)
+                    return false;
+            } else if (tMax.y < tMax.z) {
+                voxel.y += vstep.y;
+                t = tEntry + tMax.y;
+                tMax.y += tDelta.y;
+                axis = 1;
+                if(voxel.y >= BRICKSIZE)
+                    return false;
+            } else {
+                voxel.z += vstep.z;
+                t = tEntry + tMax.z;
+                tMax.z += tDelta.z;
+                axis = 2;
+                if(voxel.z >= BRICKSIZE)
+                    return false;
+            }
+            voxelID = GetVoxel(brickOffset, voxel);
+        }
+    }
+
+    return false;
+}
+
+
+
+bool TraverseVolume(Ray localRay,uint voxelDataOffset,int faxis, ivec3 voxelBounds,in out float t,out uint voxelID, out vec3 normal){
+
+    voxelID = 0;
+    int axis = faxis;
+    normal = vec3(0.0);
+
+    // removing an epsilon
+    float tEntry = t;
+    const vec3 perBrickSize = voxelSize * BRICKSIZE;
+
+    vec3 localPos = localRay.o + localRay.d * (tEntry);
+
+    uvec3 brick = ivec3(floor(localPos / perBrickSize));
+    const ivec3 bstep = ivec3(sign(localRay.d));
+    
+
+    vec3 nextBrickBoundary;
+    nextBrickBoundary.x = (bstep.x > 0) ? 
+        (float(brick.x) + 1.0) * perBrickSize.x : float(brick.x) * perBrickSize.x;
+    nextBrickBoundary.y = (bstep.y > 0) ? 
+        (float(brick.y) + 1.0) * perBrickSize.y : float(brick.y) * perBrickSize.y;
+    nextBrickBoundary.z = (bstep.z > 0) ? 
+        (float(brick.z) + 1.0) * perBrickSize.z : float(brick.z) * perBrickSize.z;
+
+    // no 0 division
+    vec3 invdir = 1.0 / max(abs(localRay.d), vec3(0.000001));
+
+    vec3 tMax = (nextBrickBoundary - localPos) / localRay.d;
+    vec3 tDelta = perBrickSize * invdir;
+
+
+    uvec3 brickBounds = (voxelBounds + (BRICKSIZE - 1)) / BRICKSIZE;
+      
+    // should never happen really..
+    if(brick.x >= brickBounds.x
+    || brick.y >= brickBounds.y
+    || brick.z >= brickBounds.z)
+        return false;
+    
+    // safety measure. no while loop
+    uint maxSteps = brickBounds.x + brickBounds.y + brickBounds.z;
+    for(int n = 0; n < maxSteps; n++){
+
+        // reading data
+        uint brickIndex = voxelDataOffset + brick.x + brick.y * brickBounds.x + brick.z * brickBounds.x * brickBounds.y;
+        uint brickAddress = bricks[brickIndex];
+        
+        if(brickAddress > 0){ // traverse brick
+            float tempT = t;
+            if(TraverseBrick(localRay, brickAddress, axis, brick, tempT,voxelID, normal)){
+                t = tempT;
+                return true;
+            }
+        } else if(localRay.inside && voxelID > 0){
+            normal = vec3(0.0);
+            normal[axis] = float(-bstep[axis]);
+            return true;
+        }
+
+        if (tMax.x < tMax.y && tMax.x < tMax.z) {
+            brick.x += bstep.x;
+            t = tEntry + tMax.x;
+            tMax.x += tDelta.x;
+            axis = 0;
+            if(brick.x >= brickBounds.x)
+                break;
+        } else if (tMax.y < tMax.z) {
+            brick.y += bstep.y;
+            t = tEntry + tMax.y;
+            tMax.y += tDelta.y;
+            axis = 1;
+            if(brick.y >= brickBounds.y)
+                break;
+        } else {
+            brick.z += bstep.z;
+            t = tEntry + tMax.z;
+            tMax.z += tDelta.z;
+            axis = 2;
+            if(brick.z >= brickBounds.z)
+                break;
+        }
+    }
+    if(localRay.inside && voxelID > 0){
+        normal = vec3(0.0);
+        normal[axis] = float(-bstep[axis]);
+        return true;
+    }
+
+    return false;
+}
+
+
+
+
+
+void Intersect(inout Ray ray,inout HitInfo info, in Volume volume){
+
+    ray.o = (volume.invModel * vec4(ray.o,1.0)).xyz; 
+    ray.d = (volume.invModel * vec4(ray.d,0.0)).xyz; 
+
+    // in the volumes object space
+    vec3 localMin = vec3(0.0);
+    vec3 localMax = vec3(volume.voxelDims.xyz) * voxelSize;
+    HitResult result = IntersectAABB(ray,localMin,localMax);
+
+
+    if(result.hit){
+        float tEntry = max(result.tmin,0.0);
+
+        uint voxelID = 0;
+        vec3 normal;
+        float tHit = tEntry + 0.0005;
+        if(TraverseVolume(ray,volume.startBrickIndex,result.axis, volume.voxelDims.xyz, tHit, voxelID, normal)){
+            if(tHit < ray.t){
+                ray.t = tHit;
+                info.voxelID = voxelID;
+                info.normal = normalize((volume.model * vec4(normal,0.0)).xyz);
+            }
+        }
+    }
+}
+
+
+
+
+void IntersectSphere(inout Ray ray, inout HitInfo info, Sphere s){
+
+    vec3 contact = s.pos- ray.o;
+    float t = dot(contact, ray.d); // project onto ray
+    vec3 q = contact - t * ray.d;
+    float squaredLength = dot(q,q);
+    if(squaredLength > s.radius * s.radius) return;
+
+    float rayInvert = (ray.inside ? 1.0 : -1.0);
+    t += rayInvert * sqrt(s.radius * s.radius - squaredLength);
+    if((t < ray.t) && (t > 0)){
+        ray.t = t;
+        info.voxelID = s.material;
+        info.normal = -rayInvert * normalize(t * ray.d - contact);
+    }
+}
+
+// normal
+// bvh traversal
+void Trace(inout Ray ray,inout HitInfo info){
+
+    info.voxelID = 0;
+    Ray cachedRay = ray;
+
+    // instead of recursive
+    // have a stack
+    uint stack[24];
+    uint stackPtr = 0;
+
+    TLASNode currentNode = voxelTlasNodes[0];
+    for(int e = 0; e < 1000; e++){
+
+        if(BLASCOUNT(currentNode) > 0){ // isleaf()
+            uint instanceID = voxelInstanceList[TLASLEFTRIGHT(currentNode)];
+
+            Intersect(ray,info,voxelVolumes[instanceID]);
+            // turn ray back to world space
+            ray.o = cachedRay.o;
+            ray.d = cachedRay.d;
+
+            if(stackPtr == 0) 
+                    break;
+                else
+                    currentNode  = voxelTlasNodes[stack[--stackPtr]];
+                continue;
+        }
+        
+        // 0xffff == 65535
+        uint left  = TLASLEFTRIGHT(currentNode);
+        uint right = left + 1;
+        TLASNode child1 = voxelTlasNodes[left];
+        TLASNode child2 = voxelTlasNodes[right];
+
+        float dist1 = IntersectAABBFloat( ray, child1.aabbmin.xyz,child1.aabbmax.xyz);
+        float dist2 = IntersectAABBFloat( ray, child2.aabbmin.xyz,child2.aabbmax.xyz);
+        if(dist1 > dist2){
+            float d = dist1;
+            dist1 = dist2;
+            dist2 = d;
+            TLASNode c = child1;
+            child1 = child2;
+            child2 = c;
+            
+            uint temp = left;
+            left = right;
+            right = temp;
+        }
+        if(dist1 >= maxDepth){
+            // missed both children nodes
+            if(stackPtr == 0)
+                break;
+            else
+                currentNode = voxelTlasNodes[stack[--stackPtr]];
+        }
+        else
+        {
+            // visit near node;
+            // push far node if ray intersects
+            currentNode = child1;
+            if(dist2 < maxDepth)   // the right node gets pushed on the stack
+                stack[stackPtr++] = right;
+        }
+    }
+
+    if(!traceSpheres)
+        return;
+
+    if(ray.t == maxDepth)
+        ray.t = 1e30;
+
+    //reset stackptr reuse previous stack.
+    stackPtr = 0;
+    currentNode = sphereTlasNodes[0];
+    for(int e = 0; e < 1000; e++){
+
+        if(BLASCOUNT(currentNode) > 0){ // isleaf()
+            uint firstIndex = TLASLEFTRIGHT(currentNode);
+            uint count = BLASCOUNT(currentNode);
+            for(int i = 0; i < count; i++){
+                uint instance = sphereInstanceList[firstIndex + i];
+                IntersectSphere(ray,info,sphereList[instance]);
+            }
+            // turn ray back to world space
+
+            if(stackPtr == 0) 
+                    break;
+            else
+                currentNode  = sphereTlasNodes[stack[--stackPtr]];
+            continue;
+        }
+        
+        // 0xffff == 65535
+        uint left  = TLASLEFTRIGHT(currentNode);
+        uint right = left + 1;
+        TLASNode child1 = sphereTlasNodes[left];
+        TLASNode child2 = sphereTlasNodes[right];
+
+        float dist1 = IntersectAABBFloat( ray, child1.aabbmin.xyz,child1.aabbmax.xyz);
+        float dist2 = IntersectAABBFloat( ray, child2.aabbmin.xyz,child2.aabbmax.xyz);
+        if(dist1 > dist2){
+            float d = dist1;
+            dist1 = dist2;
+            dist2 = d;
+            TLASNode c = child1;
+            child1 = child2;
+            child2 = c;
+            
+            uint temp = left;
+            left = right;
+            right = temp;
+        }
+        if(dist1 >= 1e30){
+            // missed both children nodes
+            if(stackPtr == 0)
+                break;
+            else
+                currentNode = sphereTlasNodes[stack[--stackPtr]];
+        }
+        else
+        {
+            // visit near node;
+            // push far node if ray intersects
+            currentNode = child1;
+            if(dist2 < 1e30)   // the right node gets pushed on the stack
+                stack[stackPtr++] = right;
+        }
+    }
+}
+
+// Ray Tracing using HIP.pdf
+// input uniform random floats
+vec3 SampleHemisphere(){
+    
+    vec2 rand = vec2(RandomFloat(),RandomFloat());
+    //vec2 rand = SampleBlueNoise2D();
+
+    vec3 dir = vec3(0);
+    float phi = TWOPI * rand.x;
+    float r   = sqrt(rand.y);
+    // uniform in circle
+    dir.x = r * cos(phi);
+    dir.z = r * sin(phi);
+
+    // project onto hemisphere
+    dir.y = sqrt(max(1.0 - r * r, 0.0));
+
+    return dir;
+}
+
+
+void StoreShadowRay(vec3 origin, vec3 normal, vec3 throughput, ivec2 pixel){
+
+    uint lightIndex = RandomUint() % lightCount;
+    
+    float dist = 1.0;
+    vec3 dir = vec3(1.0);
+
+    float distanceAttenuation = 1.0;
+    switch(lightData[lightIndex].type){
+        case 0:{ // Dir light
+            // negate direction as we are trying to go towards the light
+            dir = normalize(-lightData[lightIndex].direction.xyz);
+            // small offset for self-occlusion
+            dist = 1e30;
+            break;
+        }
+        case 1: { // point light
+            dir = lightData[lightIndex].position.xyz - origin;
+            dist = length(dir);
+            dir /= dist;
+            distanceAttenuation = 1 / (dist * dist);
+            break;
+        }
+        case 2: {// spotlight
+            dir = lightData[lightIndex].position.xyz - origin;
+            dist = length(dir);
+            dir /= dist;
+
+            vec3 negatedSpotLightDir = normalize(-lightData[lightIndex].direction.xyz);
+            // https://gamedev.stackexchange.com/questions/69475/how-do-i-use-the-dot-product-to-get-an-angle-between-two-vectors
+            // both normalized angle = arccos(dot(A,B) / (|A|* |B|)).
+            // https://learnopengl.com/Lighting/Light-casters
+            float theta = dot(dir,negatedSpotLightDir);
+            // early out
+            if(theta < lightData[lightIndex].outerCutOff){
+                return;
+            }
+            distanceAttenuation = 1 / (dist * dist);
+            break;
+        }
+    }
+
+    float cosa = dot(dir,normal);
+    if(cosa <= 0.0)
+        return; 
+
+
+    origin += EPS * voxelSize * mix(normal,dir, cosa);
+
+    RayCastInfo i;
+    i.o.xyz = origin;
+    
+    i.d.xyz = dir;
+    i.d.w = dist;
+
+    vec3 light = lightData[lightIndex].color.xyz * distanceAttenuation;
+    i.throughput.xyz = throughput * light * cosa * lightCount;
+    ivec2 size = imageSize(imgOutput);
+    int pixelIndex = pixel.x + pixel.y * size.x;
+    i.throughput.w = intBitsToFloat(pixelIndex);
+
+    uint atomicIndex = atomicAdd(writeIndexShadow, 1);
+    rayListShadow[atomicIndex] = i;
+};
+
+void main(){
+    
+    ivec2 pixel;
+    Ray ray;
+    vec3 throughput;
+    uint seed;
+    bool previouslyHitMirror;
+    bool rayStartedInside;
+    uint diffuseHits;
+    ivec2 size = imageSize(imgOutput);
+    
+    uint atomicIndex;
+
+    while(true){
+        if(!GetRayCastInfo(ray.o, ray.d, throughput, pixel, seed, previouslyHitMirror, rayStartedInside, diffuseHits))
+            return;
+
+
+        ray.inside = rayStartedInside;
+        ray.t = maxDepth;
+        g_seed = seed;
+    
+        vec4 finalColor = vec4(0.0,0.0,0.0,1.0);
+        HitInfo hitInfo;
+        Trace(ray, hitInfo);
+
+
+        bool foundLight = false;
+
+        vec3 albedo = materialData[hitInfo.voxelID].color;
+
+        if(hitInfo.voxelID == 0){
+            // equirectangular panorama texture sampling with ray.d
+            // https://jacco.ompf2.com/2022/05/27/how-to-build-a-bvh-part-8-whitted-style/
+            float domeu = (atan(ray.d.z,ray.d.x) * INV2PI + 0.5);
+            float domev = (acos(ray.d.y) * INVPI);
+            vec4 backGroundColor =  texture(skydome,vec2(domeu,domev));
+            foundLight = true;
+            albedo = backGroundColor.xyz;
+            finalColor.xyz += throughput * backGroundColor.xyz;
+        }
+
+        albedo = max(albedo,0.00001);
+
+        vec3 I = ray.o + ray.d * ray.t;
+        vec3 normal = hitInfo.normal;
+        
+        // https://jacco.ompf2.com/2024/05/29/ray-tracing-with-voxels-in-c-series-part-6/
+        vec3 brdf = albedo * INVPI;
+
+        vec3 c1 = cross(normal, vec3(0.0, 0.0, 1.0));
+        vec3 c2 = cross(normal, vec3(0.0, 1.0, 0.0));
+
+        vec3 tangent = length(c1) > length(c2)? c1 : c2;
+
+        tangent = normalize(tangent);
+        vec3 bitangent = cross(normal, tangent);
+        bitangent = normalize(bitangent);
+
+        // The hemisphere is Y - up . Transform the Y axis to the normal
+        vec3 s = SampleHemisphere();
+        vec3 reflection = tangent * s.x + bitangent * s.z + normal * s.y;
+
+        bool refractingInwards = rayStartedInside;
+        bool hitMirror = false;
+        switch(materialData[hitInfo.voxelID].type){
+        case MATERIAL_GLASS:
+            hitMirror = true;
+            float ior = materialData[hitInfo.voxelID].ior;
+            float eta = rayStartedInside ? ior : 1.0 / ior;
+            float cDot = dot(normal, ray.d);
+            float k = 1.0 - eta * eta * (1.0 - cDot * cDot);
+            if(k > 0.0 && RandomFloat() < k){
+                reflection = eta * ray.d - (eta * cDot + sqrt(k)) * normal;
+                refractingInwards = !rayStartedInside;
+            }
+            else{
+                reflection = reflect(ray.d,normal);
+            }
+            break;
+        case MATERIAL_EMIT:
+            finalColor.xyz += albedo
+            * pow(materialData[hitInfo.voxelID].emit * 8.0,materialData[hitInfo.voxelID].flux)
+            * throughput;
+
+            //  * (1 / ray.t * ray.t) doesn't seem to do anything here.
+
+            foundLight = true;
+            break;
+        default:
+            diffuseHits++;
+            break;
+        }
+
+        if(foundLight){
+            //finalColor.xyz += texelFetch(readImageOut,pixel,0).xyz;
+            finalColor.xyz += imageLoad(imgOutput,pixel).xyz;
+            finalColor.xyz = max(finalColor.xyz, vec3(0.001));
+            imageStore(imgOutput, pixel, finalColor);
+        }
+        else{
+            const bool beersLaw = false;
+            if(beersLaw && rayStartedInside){ // beers law
+                vec3 absorbtion = exp(-albedo * ray.t * voxelSize);
+                throughput *= absorbtion;
+            }
+            else
+                throughput *= albedo;
+
+            const bool UsingRussianRoulette = true;
+            if(UsingRussianRoulette){
+                float russianRoulette = max(throughput.x,max(throughput.y,throughput.z));
+                if(RandomFloat() >= russianRoulette){
+                    continue;
+                }
+                throughput *= 1 / russianRoulette;
+            }
+            ray.d = normalize(reflection);
+            ray.o = I + ray.d * voxelSize * (EPS);
+
+            if(materialData[hitInfo.voxelID].type == MATERIAL_DIFFUSE)
+                StoreShadowRay(I,normal,throughput,pixel);
+
+            // less or equal since we increment it first.
+            if(!lastBounce && diffuseHits <= maxDiffuseBounce)                         //  AKA IF FIRST ALBEDO HAS BEEN FOUND
+                StoreRay(ray.o,ray.d,throughput,pixel,hitMirror && previouslyHitMirror, refractingInwards, diffuseHits);
+        }
+
+        if(previouslyHitMirror && !hitMirror){
+            //imageStore(albedoBuffer,pixel,vec4(max(albedo,0.000001),1.0));
+        }
+    }
+}
+

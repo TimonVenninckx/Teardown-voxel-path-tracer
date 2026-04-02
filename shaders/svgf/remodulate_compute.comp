@@ -1,0 +1,28 @@
+#version 430 core
+
+
+
+
+layout(rgba32f, binding = 0) uniform image2D writeBuffer;
+
+uniform sampler2D albedoTexture;
+uniform sampler2D filterTexture;
+
+layout (local_size_x = 32, local_size_y = 32) in;
+
+
+
+
+void main(){
+    const ivec2 size = imageSize(writeBuffer);
+    ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
+
+    if(pixel.x >= size.x || pixel.y >= size.y) return;
+
+
+    vec3 color = texelFetch(filterTexture, pixel,0).xyz;
+    color *= texelFetch(albedoTexture, pixel,0).xyz;
+
+    imageStore(writeBuffer,pixel,vec4(color,1.0));
+
+}
