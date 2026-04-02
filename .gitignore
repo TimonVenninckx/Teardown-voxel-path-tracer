@@ -27,7 +27,6 @@ x64
 *.lai
 *.la
 *.a
-*.lib
 
 # Executables
 *.exe
@@ -36,3 +35,4 @@ x64
 
 # Library stuff
 .exp
+.pdb
